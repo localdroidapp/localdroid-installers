@@ -57,6 +57,42 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
+# Offline / air-gapped bundle support
+# ---------------------------------------------------------------------------
+# The "offline" install bundle ships a debs/ folder next to this script holding
+# postgresql, mosquitto, adb and all their dependencies as .deb files. When we
+# see it (or OFFLINE=1), install everything from there with dpkg — no internet,
+# no apt, no SSL. This forces air-gapped mode (plain HTTP + MQTT 1883). Zero-Touch
+# enrollment is not available in this mode (no public TLS); use in-app QR enroll.
+OFFLINE_MODE=false
+if [ "${OFFLINE:-0}" = "1" ] || ls "$SCRIPT_DIR"/debs/*.deb >/dev/null 2>&1; then
+    OFFLINE_MODE=true
+    # Use the bundled agent binaries (no download) and skip the license-authority
+    # fetch — both default to localdroid.app, which is unreachable when air-gapped.
+    export AGENT_DOWNLOAD_BASE=""
+    export LICENSE_SERVER_URL=""
+    echo -e "${CYAN}Offline bundle detected — air-gapped install, no internet required.${NC}"
+    if step_done "offline_deps"; then
+        echo -e "${GREEN}[SKIP] Bundled OS packages already installed${NC}"
+    elif ls "$SCRIPT_DIR"/debs/*.deb >/dev/null 2>&1; then
+        echo ""
+        echo "=== Installing bundled OS packages (postgresql, mosquitto, adb + deps) ==="
+        # Two passes so dpkg resolves inter-package dependencies regardless of the
+        # order the files are listed in (the bundle carries the full closure).
+        sudo dpkg -i "$SCRIPT_DIR"/debs/*.deb 2>&1 | tail -3 || true
+        sudo dpkg -i "$SCRIPT_DIR"/debs/*.deb 2>&1 | tail -3 || true
+        missing=""
+        for c in psql mosquitto; do command -v "$c" >/dev/null 2>&1 || missing="$missing $c"; done
+        if [ -n "$missing" ]; then
+            echo -e "${YELLOW}Warning: still missing:$missing — the bundled .deb set may not match this OS release/arch.${NC}"
+        else
+            echo -e "${GREEN}Bundled packages installed.${NC}"
+            mark_done "offline_deps"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # STEP 1: Server Configuration
 # ---------------------------------------------------------------------------
 if step_done "config"; then
@@ -106,8 +142,13 @@ else
     echo "     Devices connect over the internet. Requires a public IP address"
     echo "     or a domain name pointing to this server."
     echo ""
-    read -rp "Select deployment mode (1 or 2) [1]: " DEPLOY_MODE
-    DEPLOY_MODE=${DEPLOY_MODE:-1}
+    if $OFFLINE_MODE; then
+        DEPLOY_MODE=1
+        echo -e "${CYAN}Offline bundle — using Air-Gapped / Local Network mode (plain HTTP, no SSL).${NC}"
+    else
+        read -rp "Select deployment mode (1 or 2) [1]: " DEPLOY_MODE
+        DEPLOY_MODE=${DEPLOY_MODE:-1}
+    fi
 
     if [ "$DEPLOY_MODE" = "1" ]; then
         echo -e "${CYAN}Air-Gapped / Local Network mode selected.${NC}"
@@ -487,11 +528,12 @@ STORAGE_PATH=./storage
 # APK for Zero-Touch enrollment
 APK_SIGNATURE_CHECKSUM=
 
-# Licensing — air-gapped deployments stay in unlimited free mode unless you
-# paste a public key here. Set LICENSE_PUBLIC_KEY to the base64 key from
-# the LocalDroid portal, or leave both empty.
+# Licensing — the LocalDroid license-authority public key ships as the
+# default so signed license.lic files verify out of the box, including on
+# air-gapped servers (the key is public: it can only VERIFY licenses, never
+# create them). Cloud installs still refresh it from the portal below.
 LICENSE_SERVER_URL=$LICENSE_SERVER_URL
-LICENSE_PUBLIC_KEY=
+LICENSE_PUBLIC_KEY=woL+6yGOhnbu9E+iALVqMzIx1Uez7Rk2kP8pEXIQDDc=
 EOF
     fi
 
@@ -543,7 +585,7 @@ else
         echo -e "${YELLOW}  Could not reach $LICENSE_SERVER_URL/api/public-key — skipping.${NC}"
         echo -e "${YELLOW}  The MDM will start in unlimited free mode. To enable license${NC}"
         echo -e "${YELLOW}  verification later, set LICENSE_PUBLIC_KEY in $ENV_FILE and${NC}"
-        echo -e "${YELLOW}  run: docker compose restart server${NC}"
+        echo -e "${YELLOW}  run: sudo systemctl restart localdroid-backend${NC}"
         # Don't mark done — re-running the script will retry the fetch
     fi
 fi
@@ -553,9 +595,8 @@ fi
 # ---------------------------------------------------------------------------
 # The MDM server's /api/adb/* endpoints use the `adb` binary for network ADB
 # pairing/connect and device-owner setup. Without it those endpoints fail at
-# runtime. Required in BOTH cloud and air-gapped modes. The Docker image
-# installs the Alpine `android-tools` package for the same purpose; here we
-# use the Debian/RHEL equivalents.
+# runtime. Required in BOTH cloud and air-gapped modes. We install the
+# Debian/RHEL `adb` (android-tools) package for this.
 if step_done "adb_install"; then
     echo -e "${GREEN}[SKIP] adb already installed${NC}"
 elif command -v adb &>/dev/null; then
@@ -733,6 +774,14 @@ else
 
 listener 1883 0.0.0.0
 allow_anonymous true
+
+# Resource limits — a runaway client can't exhaust the broker or flood the
+# network. Size max_connections to device count plus headroom.
+max_connections 1024
+max_queued_messages 200
+max_inflight_messages 20
+message_size_limit 10485760
+max_keepalive 120
 EOF
 
         # Optional auth — same logic as the local-TLS path below.
@@ -787,6 +836,14 @@ cafile   $MQTT_CERT_DIR/chain.pem
 certfile $MQTT_CERT_DIR/fullchain.pem
 keyfile  $MQTT_CERT_DIR/privkey.pem
 allow_anonymous true
+
+# Resource limits — a runaway client can't exhaust the broker or flood the
+# network. Size max_connections to device count plus headroom.
+max_connections 1024
+max_queued_messages 200
+max_inflight_messages 20
+message_size_limit 10485760
+max_keepalive 120
 EOF
 
         # Add auth if credentials were provided

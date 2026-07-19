@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     LocalDroid MDM Server - Windows OFFLINE Installation Script
@@ -209,7 +209,7 @@ if ($DownloadInstallers) {
 Write-Step "Checking for installer files in: $InstallersDir"
 
 # Go, Node.js, and Git are only needed to BUILD from source. The air-gap zip
-# ships a prebuilt server.exe + web/dist, so those are optional — absence just
+# ships a prebuilt server.exe + web/dist, so those are optional - absence just
 # means "no source build available" (which is fine). Only PostgreSQL and
 # Mosquitto are hard requirements to run the stack.
 $optionalInstallers = @("Go", "NodeJS", "Git")
@@ -236,7 +236,7 @@ foreach ($key in $Installers.Keys) {
         Write-Success "$($installer.DisplayName): $($installer.FileName)"
     } elseif ($optionalInstallers -contains $key) {
         $Installers[$key].ActualFile = $null
-        Write-Host "  $($installer.DisplayName): not bundled (only needed for source builds — skipping)" -ForegroundColor Gray
+        Write-Host "  $($installer.DisplayName): not bundled (only needed for source builds - skipping)" -ForegroundColor Gray
     } else {
         Write-Err "$($installer.DisplayName): NOT FOUND"
         $missingInstallers += $installer.DisplayName
@@ -288,7 +288,7 @@ if (Test-StepDone "deps") {
         }
     }
 
-    # Go (only when bundled — source builds. The air-gap zip ships a prebuilt
+    # Go (only when bundled - source builds. The air-gap zip ships a prebuilt
     # server.exe, so Go is absent and this is skipped.)
     if ($Installers["Go"].ActualFile) {
         Write-Host "  Checking Go..."
@@ -307,7 +307,7 @@ if (Test-StepDone "deps") {
         }
     }
 
-    # Node.js (only when bundled — source builds. Prebuilt web/dist ships in
+    # Node.js (only when bundled - source builds. Prebuilt web/dist ships in
     # the air-gap zip, so Node is absent and this is skipped.)
     if ($Installers["NodeJS"].ActualFile) {
         Write-Host "  Checking Node.js..."
@@ -336,7 +336,7 @@ if (Test-StepDone "deps") {
         }
     }
 
-    # Git (only when bundled — source builds; not needed for a prebuilt install)
+    # Git (only when bundled - source builds; not needed for a prebuilt install)
     if ($Installers["Git"].ActualFile) {
         Write-Host "  Checking Git..."
         if (Get-Command git -ErrorAction SilentlyContinue) {
@@ -376,16 +376,16 @@ $knownPaths = @{
 }
 
 # psql is always required. go/node/npm are only required when we'll build from
-# source — the air-gap zip ships a prebuilt server.exe + web/dist, so they're
+# source - the air-gap zip ships a prebuilt server.exe + web/dist, so they're
 # not needed there. Decide based on whether the prebuilt artifacts are present.
 $prebuiltServer = Test-Path (Join-Path $serverDir "localdroid-server.exe")
 $prebuiltWeb    = Test-Path (Join-Path $serverDir "web\dist\index.html")
 $requiredTools  = @("psql")
 if (-not ($prebuiltServer -and $prebuiltWeb)) {
     $requiredTools += @("go", "node", "npm")
-    Write-Host "  (no prebuilt binaries — will build from source, so Go/Node are required)" -ForegroundColor Gray
+    Write-Host "  (no prebuilt binaries - will build from source, so Go/Node are required)" -ForegroundColor Gray
 } else {
-    Write-Host "  Prebuilt server.exe + web/dist present — Go/Node not required." -ForegroundColor Gray
+    Write-Host "  Prebuilt server.exe + web/dist present - Go/Node not required." -ForegroundColor Gray
 }
 
 $allFound = $true
@@ -574,12 +574,12 @@ DEPLOYMENT_MODE=$deployModeStr
 STORAGE_PATH=./storage
 APK_SIGNATURE_CHECKSUM=
 
-# Licensing - this offline installer leaves licensing disabled. The MDM
-# defaults to unlimited free mode. To enable license verification later,
-# paste the base64 public key from your license server into LICENSE_PUBLIC_KEY
-# and restart the localdroid-backend service.
+# Licensing - the LocalDroid license-authority public key ships as the
+# default so a signed license.lic verifies out of the box on air-gapped
+# servers (the key is public: it can only VERIFY licenses, never create
+# them). Point LOCALDROID_LICENSE_FILE at your license.lic to auto-activate.
 LICENSE_SERVER_URL=
-LICENSE_PUBLIC_KEY=
+LICENSE_PUBLIC_KEY=woL+6yGOhnbu9E+iALVqMzIx1Uez7Rk2kP8pEXIQDDc=
 
 # Administrator credentials - seeded into the users table on first boot.
 # Setting LOCALDROID_ADMIN_PASSWORD here is authoritative: changing it
@@ -627,10 +627,10 @@ $distDst = Join-Path $serverDir "web\dist"
 if (Test-StepDone "web_build") {
     Write-Success "Web UI already built, skipping"
 } elseif (Test-Path (Join-Path $distDst "index.html")) {
-    # Prebuilt web UI shipped in the bundle (source-free install) — no Node,
+    # Prebuilt web UI shipped in the bundle (source-free install) - no Node,
     # no web/ source needed. This is the normal path for the air-gap zip.
     Set-StepComplete "web_build"
-    Write-Success "Prebuilt web UI found at server\web\dist — skipping build"
+    Write-Success "Prebuilt web UI found at server\web\dist - skipping build"
 } else {
     if (-not (Test-Path $webDir)) { Write-Err "Web directory not found: $webDir (and no prebuilt server\web\dist)"; exit 1 }
 
@@ -681,9 +681,9 @@ if (Test-StepDone "server_build") {
     Write-Success "Server already built, skipping"
 } elseif (Test-Path $serverExe) {
     # Prebuilt, cross-compiled server.exe shipped in the bundle (source-free
-    # install) — no Go, no server/ source needed. Normal path for the air-gap zip.
+    # install) - no Go, no server/ source needed. Normal path for the air-gap zip.
     Set-StepComplete "server_build"
-    Write-Success "Prebuilt localdroid-server.exe found — skipping build"
+    Write-Success "Prebuilt localdroid-server.exe found - skipping build"
 } else {
     if (-not (Test-Path $serverDir)) { Write-Err "Server directory not found: $serverDir (and no prebuilt localdroid-server.exe)"; exit 1 }
 
@@ -725,7 +725,7 @@ if (Test-StepDone "apk") {
 } else {
     New-Item -ItemType Directory -Path $agentStorageDir -Force | Out-Null
 
-    # Offline installer — local files only. seed/ is the canonical bundle
+    # Offline installer - local files only. seed/ is the canonical bundle
     # layout; releases/ stays for backwards compat with older deployments.
     $localApk = @(
         (Join-Path $ScriptDir "seed\localdroid-agent.apk"),
@@ -748,7 +748,7 @@ if (Test-StepDone "apk") {
 }
 
 # STEP 9b: APK signing-cert checksum (Zero-Touch enrollment verification).
-# Air-gapped boxes won't have Android build-tools — the sidecar file is the
+# Air-gapped boxes won't have Android build-tools - the sidecar file is the
 # REQUIRED source here. build-native-bundle.sh produces it; if it's missing,
 # we can't recover and Zero-Touch will fail.
 if (Test-Path $apkDest) {
@@ -787,7 +787,7 @@ if (Test-Path $apkDest) {
 # STEP 9c: Baked-in customer license (optional)
 # ============================================================================
 # If the bundle shipped a license.lic, install it next to the server and point
-# LOCALDROID_LICENSE_FILE at it so the server auto-activates on first start —
+# LOCALDROID_LICENSE_FILE at it so the server auto-activates on first start -
 # the customer never pastes a license. Mirrors install.sh STEP 9b (Linux).
 Write-Step "Step 9c: Customer License"
 if (Test-StepDone "license_seed") {
@@ -803,9 +803,9 @@ if (Test-StepDone "license_seed") {
         } else {
             Add-Content -Path $envPath -Value "LOCALDROID_LICENSE_FILE=$licenseDest" -Encoding ASCII
         }
-        Write-Success "License staged — MDM will auto-activate on first start"
+        Write-Success "License staged - MDM will auto-activate on first start"
     } else {
-        Write-Host "  No bundled license.lic — MDM starts unlicensed (activate later under Settings -> License)." -ForegroundColor Gray
+        Write-Host "  No bundled license.lic - MDM starts unlicensed (activate later under Settings -> License)." -ForegroundColor Gray
     }
     Set-StepComplete "license_seed"
 }
@@ -824,6 +824,14 @@ if (Test-StepDone "mosquitto") {
 # LocalDroid Mosquitto Configuration
 listener $mqttPort
 allow_anonymous true
+
+# Resource limits — a runaway client can't exhaust the broker or flood the
+# network. Size max_connections to device count plus headroom.
+max_connections 1024
+max_queued_messages 200
+max_inflight_messages 20
+message_size_limit 10485760
+max_keepalive 120
 "@ | Out-File -FilePath $mqConfPath -Encoding UTF8
         Set-StepComplete "mosquitto"
         Write-Success "Mosquitto configured on port $mqttPort"
@@ -866,7 +874,7 @@ pause
 }
 
 # ============================================================================
-# STEP 12: Remote control — firewall + TURN guidance
+# STEP 12: Remote control - firewall + TURN guidance
 # ============================================================================
 # Windows VNC relays through the Go server (server port only). Android WebRTC
 # remote control over the internet needs a TURN relay (coturn), which has no
@@ -879,6 +887,7 @@ if (Test-StepDone "remote_firewall") {
 } else {
     $fwRules = @(
         @{ Name = "LocalDroid Server $serverPort/tcp"; Port = $serverPort; Proto = "TCP" },
+        @{ Name = "LocalDroid MQTT $mqttPort/tcp";      Port = $mqttPort;    Proto = "TCP" },
         @{ Name = "LocalDroid TURN 3478/tcp";          Port = 3478;         Proto = "TCP" },
         @{ Name = "LocalDroid TURN 3478/udp";          Port = 3478;         Proto = "UDP" }
     )
@@ -906,10 +915,9 @@ if (Test-StepDone "remote_firewall") {
 
     Write-Host ""
     Write-Host "Android remote control over the internet needs a TURN relay (coturn)." -ForegroundColor Yellow
-    Write-Host "coturn has no native Windows package. Provide one on a Linux box/VPS, or" -ForegroundColor Yellow
-    Write-Host "via Docker Desktop / WSL2 on this host:" -ForegroundColor Yellow
-    Write-Host '      docker run -d --name coturn --network host coturn/coturn:4 \' -ForegroundColor Gray
-    Write-Host '        -n --use-auth-secret --static-auth-secret=localdroid_turn_secret_2024 \' -ForegroundColor Gray
+    Write-Host "coturn has no native Windows package. Provide one on a Linux box/VPS" -ForegroundColor Yellow
+    Write-Host "(apt install coturn):" -ForegroundColor Yellow
+    Write-Host '      turnserver -n --use-auth-secret --static-auth-secret=localdroid_turn_secret_2024 \' -ForegroundColor Gray
     Write-Host "        --realm=$serverIP --min-port=49152 --max-port=49200 --external-ip=<PUBLIC_IP>" -ForegroundColor Gray
     Write-Host "  Keep the secret as 'localdroid_turn_secret_2024' to match the clients." -ForegroundColor Yellow
     Write-Host "Windows-device VNC works with no TURN server." -ForegroundColor Green

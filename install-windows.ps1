@@ -462,11 +462,12 @@ DEPLOYMENT_MODE=$deployModeStr
 STORAGE_PATH=./storage
 APK_SIGNATURE_CHECKSUM=
 
-# Licensing - leave empty to run in unlimited free mode. To enable license
-# verification, set LICENSE_SERVER_URL and LICENSE_PUBLIC_KEY (auto-fetched
-# below if the server is reachable).
+# Licensing - the LocalDroid license-authority public key ships as the
+# default so signed license.lic files verify out of the box (the key is
+# public: it can only VERIFY licenses, never create them). Auto-refreshed
+# from the portal below when LICENSE_SERVER_URL is reachable.
 LICENSE_SERVER_URL=$licenseServerUrl
-LICENSE_PUBLIC_KEY=
+LICENSE_PUBLIC_KEY=woL+6yGOhnbu9E+iALVqMzIx1Uez7Rk2kP8pEXIQDDc=
 
 # Administrator credentials - seeded into the users table on first boot.
 # Setting LOCALDROID_ADMIN_PASSWORD here is authoritative: changing it
@@ -747,6 +748,14 @@ if (Test-StepDone "mosquitto") {
 # LocalDroid Mosquitto Configuration
 listener $mqttPort
 allow_anonymous true
+
+# Resource limits — a runaway client can't exhaust the broker or flood the
+# network. Size max_connections to device count plus headroom.
+max_connections 1024
+max_queued_messages 200
+max_inflight_messages 20
+message_size_limit 10485760
+max_keepalive 120
 "@ | Out-File -FilePath $mqConfPath -Encoding UTF8
         Set-StepComplete "mosquitto"
         Write-Success "Mosquitto configured on port $mqttPort"
@@ -833,11 +842,9 @@ if (Test-StepDone "remote_firewall") {
 
     Write-Host ""
     Write-Host "Android remote control over the internet needs a TURN relay (coturn)." -ForegroundColor Yellow
-    Write-Host "coturn has no native Windows package. To provide one, EITHER:" -ForegroundColor Yellow
-    Write-Host "  - run it on a small Linux box / VPS, OR" -ForegroundColor Yellow
-    Write-Host "  - run it via Docker Desktop / WSL2 on this host, e.g.:" -ForegroundColor Yellow
-    Write-Host '      docker run -d --name coturn --network host coturn/coturn:4 \' -ForegroundColor Gray
-    Write-Host '        -n --use-auth-secret --static-auth-secret=localdroid_turn_secret_2024 \' -ForegroundColor Gray
+    Write-Host "coturn has no native Windows package. Run it on a small Linux box / VPS," -ForegroundColor Yellow
+    Write-Host "e.g. (apt install coturn):" -ForegroundColor Yellow
+    Write-Host '      turnserver -n --use-auth-secret --static-auth-secret=localdroid_turn_secret_2024 \' -ForegroundColor Gray
     Write-Host "        --realm=$serverIP --min-port=49152 --max-port=49200 --external-ip=<PUBLIC_IP>" -ForegroundColor Gray
     Write-Host "  The static-auth-secret MUST stay 'localdroid_turn_secret_2024' to match clients." -ForegroundColor Yellow
     Write-Host "Windows-device VNC works with no TURN server — server port only." -ForegroundColor Green
