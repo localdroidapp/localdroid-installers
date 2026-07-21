@@ -70,6 +70,7 @@ if [ "${OFFLINE:-0}" = "1" ] || ls "$SCRIPT_DIR"/debs/*.deb >/dev/null 2>&1; the
     # Use the bundled agent binaries (no download) and skip the license-authority
     # fetch — both default to localdroid.app, which is unreachable when air-gapped.
     export AGENT_DOWNLOAD_BASE=""
+    export AGENT_RELEASE_BASE=""
     export LICENSE_SERVER_URL=""
     echo -e "${CYAN}Offline bundle detected — air-gapped install, no internet required.${NC}"
     if step_done "offline_deps"; then
@@ -156,6 +157,27 @@ else
     else
         echo -e "${CYAN}Internet Connected (Cloud) mode selected.${NC}"
         DEPLOYMENT_MODE="cloud"
+        echo ""
+        echo -e "${YELLOW}=== Cloud mode prerequisites (read before continuing) ===${NC}"
+        echo "This mode obtains real Let's Encrypt certificates for HTTPS and MQTT TLS."
+        echo "For that to succeed, BEFORE you continue you must have:"
+        echo ""
+        echo -e "  1. A ${CYAN}public domain name${NC} for this server (used for both the web/API"
+        echo "     and MQTT, or a separate hostname for each)."
+        echo -e "  2. A ${CYAN}public DNS A-record${NC} for that domain pointing at THIS server's"
+        echo "     PUBLIC IP. It must resolve publicly — a LAN-only / split-horizon"
+        echo "     record is not enough; Let's Encrypt validates from the internet."
+        echo -e "  3. ${CYAN}Port 80/tcp reachable from the internet${NC} during install — the"
+        echo "     certificate challenge runs an HTTP check on port 80 (the installer"
+        echo "     frees it temporarily). Open it on the host AND any router/cloud firewall."
+        echo -e "  4. ${CYAN}Ports 443/tcp${NC} (HTTPS) and ${CYAN}8883/tcp${NC} (MQTT over TLS) open for"
+        echo "     day-to-day device connections."
+        echo ""
+        echo "If any of these aren't ready, press Ctrl+C, fix them, and re-run — the"
+        echo "installer resumes where it left off. (Certificates that can't be issued"
+        echo "will cause MQTT/HTTPS TLS steps to be skipped.)"
+        echo ""
+        read -rp "Press Enter to confirm these are in place and continue... " _
     fi
 
     # --- Server address with mode-specific guidance ---
@@ -809,7 +831,10 @@ EOF
             echo -e "${RED}Mosquitto failed to start. Check: sudo journalctl -u mosquitto -n 20${NC}"
             exit 1
         fi
-    elif [ ! -d "$MQTT_CERT_SRC" ]; then
+    elif ! sudo test -d "$MQTT_CERT_SRC"; then
+        # NOTE: /etc/letsencrypt/live and /archive are mode 700 (root-only), so a
+        # plain "[ -d ... ]" as the non-root installer always fails even when the
+        # cert exists. Probe with "sudo test -d" so we don't wrongly skip TLS.
         echo -e "${YELLOW}Let's Encrypt cert for $MQTT_DOMAIN not found — skipping Mosquitto TLS config.${NC}"
         echo "  Re-run this script after the SSL cert step succeeds."
     else
@@ -1329,14 +1354,18 @@ fi
 # hand-rolled deployments may have them in releases/. Developers building the
 # Android APK from source get a fallback for android-agent/.
 #
-# If no local copy is found, we fall back to downloading from the operator's
-# OWN public mirror (AGENT_DOWNLOAD_BASE, default https://localdroid.app/agent).
-# This is NOT the private source repo — it's a stable HTTPS endpoint that hosts
-# the same binaries the bundle ships, so a "thin" bundle (no seed/) can still
-# self-provision. Local seed/ always wins; the network is only a fallback.
-# Override or disable: AGENT_DOWNLOAD_BASE=https://your.mirror/agent ./install.sh
-# (set AGENT_DOWNLOAD_BASE="" to force local-only / air-gapped).
+# If no local copy is found, we fall back to downloading over HTTPS — first from
+# the operator's OWN public mirror (AGENT_DOWNLOAD_BASE, default
+# https://localdroid.app/agent), then from the public installers repo's latest
+# GitHub release (AGENT_RELEASE_BASE). Neither is the private source repo — both
+# host the same binaries the bundle ships, so a "thin" bundle (no seed/) can
+# still self-provision. The GitHub release is the canonical home for the Windows
+# EXE (the localdroid.app mirror only carries the APK), so it's a required
+# fallback, not a nicety. Local seed/ always wins; the network is only a backstop.
+# Override: AGENT_DOWNLOAD_BASE=https://your.mirror/agent ./install.sh
+# Disable both (force local-only / air-gapped): set them to "".
 AGENT_DOWNLOAD_BASE="${AGENT_DOWNLOAD_BASE-https://localdroid.app/agent}"
+AGENT_RELEASE_BASE="${AGENT_RELEASE_BASE-https://github.com/localdroidapp/localdroid-installers/releases/latest/download}"
 AGENT_STORAGE="$SCRIPT_DIR/server/storage/agent"
 mkdir -p "$AGENT_STORAGE"
 
@@ -1378,36 +1407,43 @@ seed_agent_binary() {
         fi
     done
 
-    # Fallback: download from the operator's public mirror over HTTPS. Only
-    # the APK/EXE — never source. Also pulls the .cert-sha256 sidecar (APK)
-    # so Zero-Touch enrollment has its checksum without apksigner on this box.
-    if [ -n "$AGENT_DOWNLOAD_BASE" ] && command -v curl &>/dev/null; then
-        local url="$AGENT_DOWNLOAD_BASE/$filename"
-        echo "No local $label agent — trying mirror: $url"
-        if curl -fSL --connect-timeout 10 --retry 2 -o "$dest.partial" "$url" 2>/dev/null \
-           && [ -s "$dest.partial" ]; then
-            mv "$dest.partial" "$dest"
-            local size=$(du -h "$dest" | cut -f1)
-            echo -e "${GREEN}$label agent downloaded: $url → $dest ($size)${NC}"
-            # Best-effort: grab the cert sidecar alongside the APK.
-            if [ "$filename" = "localdroid-agent.apk" ]; then
-                curl -fsSL --connect-timeout 10 -o "$AGENT_STORAGE/$filename.cert-sha256" \
-                    "$url.cert-sha256" 2>/dev/null \
-                    && echo "  fetched cert sidecar for checksum" || true
+    # Fallback: download over HTTPS. Try the operator mirror first, then the
+    # public installers-repo GitHub release. Only the APK/EXE — never source.
+    # Also pulls the .cert-sha256 sidecar (APK) so Zero-Touch enrollment has its
+    # checksum without apksigner on this box.
+    if command -v curl &>/dev/null; then
+        local base url
+        for base in "$AGENT_DOWNLOAD_BASE" "$AGENT_RELEASE_BASE"; do
+            [ -z "$base" ] && continue
+            url="${base%/}/$filename"
+            echo "No local $label agent — trying: $url"
+            if curl -fSL --connect-timeout 10 --retry 2 -o "$dest.partial" "$url" 2>/dev/null \
+               && [ -s "$dest.partial" ]; then
+                mv "$dest.partial" "$dest"
+                local size=$(du -h "$dest" | cut -f1)
+                echo -e "${GREEN}$label agent downloaded: $url → $dest ($size)${NC}"
+                # Best-effort: grab the cert sidecar alongside the APK.
+                if [ "$filename" = "localdroid-agent.apk" ]; then
+                    curl -fsSL --connect-timeout 10 -o "$AGENT_STORAGE/$filename.cert-sha256" \
+                        "${base%/}/$filename.cert-sha256" 2>/dev/null \
+                        && echo "  fetched cert sidecar for checksum" || true
+                fi
+                return 0
             fi
-            return 0
-        fi
-        rm -f "$dest.partial"
-        echo -e "${YELLOW}  Mirror download failed (offline or 404).${NC}"
+            rm -f "$dest.partial"
+            echo -e "${YELLOW}  Not available at $url${NC}"
+        done
+        echo -e "${YELLOW}  Download failed from all sources (offline or 404).${NC}"
     fi
 
-    echo -e "${YELLOW}No $label agent ($filename) found locally or on the mirror.${NC}"
+    echo -e "${YELLOW}No $label agent ($filename) found locally or online.${NC}"
     echo "  Searched:"
     local c
     for c in "${candidates[@]}"; do
         echo "    $c"
     done
     [ -n "$AGENT_DOWNLOAD_BASE" ] && echo "    $AGENT_DOWNLOAD_BASE/$filename (mirror)"
+    [ -n "$AGENT_RELEASE_BASE" ]  && echo "    $AGENT_RELEASE_BASE/$filename (GitHub release)"
     echo -e "${YELLOW}  Drop a copy at $dest then re-run, or place $filename in seed/.${NC}"
     return 1
 }
