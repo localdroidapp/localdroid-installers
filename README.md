@@ -17,7 +17,7 @@ toolchain on the server.
 | **Linux (x86-64)** | `localdroid-native-linux-amd64-*.tar.gz` | Yes (installs deps via apt) |
 | **Raspberry Pi (64-bit)** | `localdroid-native-linux-arm64-*.tar.gz` | Yes (installs deps via apt) |
 | **Windows Server** — air-gapped | `localdroid-airgap-windows-*.zip` | No — fully offline |
-| **Windows Server** — online | *(coming soon)* | Yes |
+| **Windows Server** — internet-connected (cloud) | `localdroid-airgap-windows-*.zip` + `install-windows-cloud.ps1` | Yes |
 | **Linux / Pi** — fully air-gapped | *(coming soon: bundles all OS packages)* | No |
 
 Device agents (also bundled inside each installer, and here as standalone
@@ -42,13 +42,77 @@ The installer asks whether this is an **air-gapped / local network** or an
 **internet-connected** deployment and configures everything (PostgreSQL,
 Mosquitto, the server, and — for internet mode — nginx + TLS) accordingly.
 
-### Windows Server (air-gapped)
+### Windows Server (air-gapped / local network)
 
 1. Extract `localdroid-airgap-windows-*.zip` to a persistent folder (e.g. `C:\LocalDroid`).
 2. Right-click **`install-windows-offline.ps1`** → **Run with PowerShell** (as Administrator).
 
 Everything it needs (PostgreSQL, Mosquitto, the server, the web UI, the agents)
 is inside the zip — no internet required.
+
+### Windows Server (internet-connected / cloud)
+
+Use this when devices connect over the internet rather than sitting on the same
+LAN — a public domain name, HTTPS, and MQTT over TLS.
+
+1. Extract `localdroid-airgap-windows-*.zip` to a persistent folder (e.g. `C:\LocalDroid`).
+   It carries the prebuilt server, web UI, migrations and agents that the cloud
+   installer needs.
+2. Open PowerShell **as Administrator**, then drop
+   [`install-windows-cloud.ps1`](install-windows-cloud.ps1) into that same folder,
+   next to `install-windows-offline.ps1`:
+
+   ```powershell
+   cd C:\LocalDroid
+   Invoke-WebRequest -UseBasicParsing `
+     -Uri https://raw.githubusercontent.com/localdroidapp/localdroid-installers/main/install-windows-cloud.ps1 `
+     -OutFile install-windows-cloud.ps1
+   ```
+
+3. Run it:
+
+   ```powershell
+   .\install-windows-cloud.ps1
+   ```
+
+**Do not** use `install-windows-offline.ps1` for a cloud deployment. Its
+"Internet Connected" menu option only tags the config as cloud — it still asks
+for a LAN IP, writes a plain-`http://` external URL, and sets up an anonymous
+MQTT broker. `install-windows-cloud.ps1` is the one that asks for your public
+domain and configures a real internet-facing server.
+
+Before you start, have these ready:
+
+- A **public domain name** for the server (e.g. `mdm.yourcompany.com`).
+- A **public DNS A-record** for it pointing at the server's public IP.
+  Split-horizon / LAN-only DNS is not enough — Let's Encrypt validates from
+  the internet.
+- **Port 80/tcp** reachable from the internet during install (certificate
+  challenge), plus **443/tcp** and **8883/tcp** open for day-to-day traffic —
+  on the Windows firewall *and* your router or cloud security group.
+
+What it sets up beyond the air-gapped installer:
+
+| | |
+|---|---|
+| **HTTPS** | Free Let's Encrypt certificates, issued during install and auto-renewed daily. Or bring your own PEM files, or terminate TLS on an existing reverse proxy. |
+| **MQTT over TLS** | Public listener on 8883 with per-device credentials; the loopback listener stays anonymous for the server itself. |
+| **Cloud config** | `CLOUD_MODE`, `ALLOW_REMOTE_ENROLLMENT`, `ALLOWED_ORIGINS`, `TRUST_PROXY`, `MQTT_AUTH_DIR` — what Zero-Touch enrollment and remote devices need. |
+| **Runs as a service** | Scheduled task as SYSTEM: starts at boot, restarts on crash, no console window to keep open. |
+| **Pre-flight + verify** | Checks public DNS, public IP and port availability first, then confirms HTTPS works end-to-end before reporting success. |
+
+The install is resumable — fix whatever a step complains about and re-run it:
+
+```powershell
+.\install-windows-cloud.ps1 -ResetStep tls      # retry just the certificate step
+.\install-windows-cloud.ps1 -Staging            # rehearse against Let's Encrypt staging
+.\install-windows-cloud.ps1 -Fresh              # start over
+```
+
+> **Android remote control** over the internet also needs a TURN relay (coturn),
+> which has no native Windows build — run it on a small Linux VPS. Windows
+> device VNC is relayed over HTTPS and needs nothing extra. The installer prints
+> the exact coturn command at the end.
 
 ## After install
 
