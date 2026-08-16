@@ -17,7 +17,7 @@ toolchain on the server.
 | **Linux (x86-64)** | `localdroid-native-linux-amd64-*.tar.gz` | Yes (installs deps via apt) |
 | **Raspberry Pi (64-bit)** | `localdroid-native-linux-arm64-*.tar.gz` | Yes (installs deps via apt) |
 | **Windows Server** — air-gapped | `localdroid-airgap-windows-*.zip` | No — fully offline |
-| **Windows Server** — internet-connected (cloud) | `localdroid-airgap-windows-*.zip` + `install-windows-cloud.ps1` | Yes |
+| **Windows Server** — internet-connected (cloud) | `localdroid-airgap-windows-*.zip` | Yes |
 | **Linux / Pi** — fully air-gapped | *(coming soon: bundles all OS packages)* | No |
 
 Device agents (also bundled inside each installer, and here as standalone
@@ -56,24 +56,24 @@ Use this when devices connect over the internet rather than sitting on the same
 LAN — a public domain name, HTTPS, and MQTT over TLS.
 
 1. Extract `localdroid-airgap-windows-*.zip` to a persistent folder (e.g. `C:\LocalDroid`).
-   It carries the prebuilt server, web UI, migrations and agents that the cloud
-   installer needs.
-2. Open PowerShell **as Administrator**, then drop
-   [`install-windows-cloud.ps1`](install-windows-cloud.ps1) into that same folder,
-   next to `install-windows-offline.ps1`:
+   Despite the `airgap` name, the zip carries the prebuilt server, web UI,
+   migrations and agents that **both** Windows installers use.
+2. Open PowerShell **as Administrator** and run the cloud installer:
 
    ```powershell
    cd C:\LocalDroid
-   Invoke-WebRequest -UseBasicParsing `
-     -Uri https://raw.githubusercontent.com/localdroidapp/localdroid-installers/main/install-windows-cloud.ps1 `
-     -OutFile install-windows-cloud.ps1
-   ```
-
-3. Run it:
-
-   ```powershell
    .\install-windows-cloud.ps1
    ```
+
+> **Using a zip from before v1.7.5?** Those predate the cloud installer, so it
+> won't be in the folder. Fetch it alongside `install-windows-offline.ps1` first:
+>
+> ```powershell
+> cd C:\LocalDroid
+> Invoke-WebRequest -UseBasicParsing `
+>   -Uri https://raw.githubusercontent.com/localdroidapp/localdroid-installers/main/install-windows-cloud.ps1 `
+>   -OutFile install-windows-cloud.ps1
+> ```
 
 **Do not** use `install-windows-offline.ps1` for a cloud deployment. Its
 "Internet Connected" menu option only tags the config as cloud — it still asks

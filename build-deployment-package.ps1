@@ -215,21 +215,70 @@ if ($IncludeInstallers) {
 }
 
 # ============================================================================
-# Create the install script for target machine
+# Create the install scripts for the target machine
 # ============================================================================
-Write-Step "Creating install script..."
-Copy-Item "$ScriptDir\deploy\install-airgapped.ps1" "$stagingDir\install.ps1" -ErrorAction SilentlyContinue
-if (-not (Test-Path "$stagingDir\install.ps1")) {
-    Write-Host "[WARN] install-airgapped.ps1 not found in deploy folder, skipping" -ForegroundColor Yellow
+# Both Windows installers ship in every package. They read the same bundle
+# layout and differ only in how they configure the deployment:
+#   install-windows-offline.ps1 - air-gapped / local network (plain HTTP, LAN IP)
+#   install-windows-cloud.ps1   - internet-connected (public domain, HTTPS,
+#                                 MQTT over TLS, per-device broker auth)
+# Shipping only the air-gapped one is what left cloud customers with no working
+# Windows path, so a missing cloud installer is a hard failure here, not a warning.
+Write-Step "Creating install scripts..."
+
+$installScripts = @(
+    @{ Name = "install-windows-offline.ps1"; Label = "Air-gapped installer"; Required = $true },
+    @{ Name = "install-windows-cloud.ps1";   Label = "Cloud installer";      Required = $true }
+)
+
+foreach ($s in $installScripts) {
+    # The packaging script may run from the source repo root or from a checkout
+    # of the public installers repo - look in both.
+    $candidates = @(
+        (Join-Path $ScriptDir $s.Name),
+        (Join-Path $ScriptDir "deploy\$($s.Name)"),
+        (Join-Path $ScriptDir "installers\$($s.Name)")
+    )
+    $src = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($src) {
+        Copy-Item $src (Join-Path $stagingDir $s.Name) -Force
+        Write-Success "$($s.Label): $($s.Name)"
+    } elseif ($s.Required) {
+        Write-Err "$($s.Label) not found: $($s.Name)"
+        Write-Host "  Looked in:" -ForegroundColor Yellow
+        $candidates | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+        exit 1
+    } else {
+        Write-Host "  [WARN] $($s.Label) not found, skipping" -ForegroundColor Yellow
+    }
 }
+
+# Legacy entry point - older docs tell people to run install.ps1.
+Copy-Item "$ScriptDir\deploy\install-airgapped.ps1" "$stagingDir\install.ps1" -ErrorAction SilentlyContinue
 
 # ============================================================================
 # Create README
 # ============================================================================
 $readme = @"
-# LocalDroid MDM - Air-Gapped Deployment Package
+# LocalDroid MDM - Windows Deployment Package
 
 Built: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+
+## Which installer do I run?
+
+This package contains both Windows installers. Pick the one that matches how
+devices will reach the server:
+
+| Your deployment | Run |
+|---|---|
+| Devices on the same local network (air-gapped) | ``.\install-windows-offline.ps1`` |
+| Devices connect over the internet (cloud) | ``.\install-windows-cloud.ps1`` |
+
+**Do not use the air-gapped installer for an internet-connected server.** Its
+"Internet Connected" menu option only tags the config as cloud - it still asks
+for a LAN IP, writes a plain ``http://`` external URL, and leaves the MQTT
+broker anonymous. The cloud installer is the one that asks for your public
+domain and sets up HTTPS, MQTT over TLS and per-device broker credentials.
 
 ## Prerequisites
 
@@ -237,12 +286,25 @@ Install on the target Windows server:
 1. **PostgreSQL 16+** (installers included if built with -IncludeInstallers)
 2. **Mosquitto MQTT 2.0+** (installers included if built with -IncludeInstallers)
 
+The cloud installer downloads either of these automatically if they are not
+bundled - a cloud server has internet access by definition.
+
+### Extra prerequisites for a cloud install
+
+- A public domain name for this server (e.g. ``mdm.yourcompany.com``)
+- A public DNS A-record for it pointing at this server's public IP
+- Port 80/tcp reachable from the internet during install (certificate
+  challenge), plus 443/tcp and 8883/tcp open for day-to-day traffic
+
 ## Quick Install
 
 1. Copy this entire folder to the target server
 2. Open PowerShell **as Administrator**
-3. Run: ``.\install.ps1``
+3. Run the installer for your deployment (see the table above)
 4. Follow the prompts
+
+Both installers are resumable - if a step fails, fix the cause and re-run.
+Completed steps are skipped.
 
 ## Manual Install
 
@@ -294,7 +356,8 @@ cd server
 - ``server\storage\agent\`` - Android agent APK
 - ``mosquitto\`` - MQTT broker configuration
 - ``installers\`` - Third-party installers (if included)
-- ``install.ps1`` - Automated install script
+- ``install-windows-offline.ps1`` - Air-gapped / local network installer
+- ``install-windows-cloud.ps1`` - Internet-connected (cloud) installer
 "@
 $readme | Out-File -FilePath "$stagingDir\README.md" -Encoding UTF8
 Write-Success "README created"
