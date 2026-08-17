@@ -13,7 +13,8 @@
     Clear all saved progress and start the installation from scratch.
 .PARAMETER ResetStep
     Re-run a specific step by name (e.g. -ResetStep web_build).
-    Step names: deps, config, database, env, migrations, web_build,
+    Step names: deps, config, database, env, migrations, letsencrypt,
+                tls_automation, mosquitto, startup, apk, web_build,
                 server_build, apk, mosquitto, startup
 .EXAMPLE
     .\install-windows-offline.ps1 -DownloadInstallers
@@ -322,17 +323,57 @@ if (Test-StepDone "deps") {
 
     # Mosquitto
     Write-Host "  Checking Mosquitto..."
-    if (Test-Path "C:\Program Files\mosquitto\mosquitto.exe") {
+    $mqExe = "C:\Program Files\mosquitto\mosquitto.exe"
+    if (Test-Path $mqExe) {
         Write-Success "Mosquitto already installed"
     } else {
         Write-Host "  Running Mosquitto installer..."
         $mqInstaller = $Installers["Mosquitto"].ActualFile
         Start-Process -FilePath $mqInstaller -ArgumentList "/S" -Wait
+
+        # The NSIS installer exits 0 even when a silent run installs nothing
+        # (a missing Visual C++ runtime is the usual cause). Verify instead of
+        # trusting it: an absent broker surfaces much later and much more
+        # confusingly, as devices that simply never connect.
+        if (-not (Test-Path $mqExe)) {
+            Write-Warn "Silent install produced no mosquitto.exe - retrying interactively."
+            Write-Host "  Complete the wizard, ticking the 'Service' component." -ForegroundColor Yellow
+            Start-Process -FilePath $mqInstaller -Wait
+        }
+        if (-not (Test-Path $mqExe)) {
+            Write-Err "Mosquitto failed to install."
+            Write-Host "  LocalDroid cannot run without the broker - devices talk to it for" -ForegroundColor Yellow
+            Write-Host "  every command. Install it by hand from:" -ForegroundColor Yellow
+            Write-Host "    $mqInstaller" -ForegroundColor White
+            Write-Host "  If it refuses, install the Visual C++ Redistributable first." -ForegroundColor Yellow
+            Write-Host "  Then re-run this script." -ForegroundColor Yellow
+            exit 1
+        }
         $mqBin = "C:\Program Files\mosquitto"
         $cp = [Environment]::GetEnvironmentVariable("Path", "Machine")
         if ($cp -notlike "*$mqBin*") {
             [Environment]::SetEnvironmentVariable("Path", "$cp;$mqBin", "Machine")
             $env:Path = "$env:Path;$mqBin"
+        }
+    }
+
+    # A silent install can drop the binary without registering the Windows
+    # service, which leaves a broker that never starts at boot. Register it
+    # if it's missing.
+    if ((Test-Path $mqExe) -and -not (Get-Service mosquitto -ErrorAction SilentlyContinue)) {
+        Write-Host "  Registering the Mosquitto service..."
+        try { & $mqExe install 2>&1 | Out-Null } catch {}
+        if (-not (Get-Service mosquitto -ErrorAction SilentlyContinue)) {
+            try {
+                New-Service -Name mosquitto -DisplayName "Mosquitto Broker" `
+                    -BinaryPathName "`"$mqExe`" run" -StartupType Automatic -ErrorAction Stop | Out-Null
+            } catch {
+                Write-Warn "Could not register the Mosquitto service: $_"
+            }
+        }
+        if (Get-Service mosquitto -ErrorAction SilentlyContinue) {
+            Set-Service mosquitto -StartupType Automatic -ErrorAction SilentlyContinue
+            Write-Success "Mosquitto service registered"
         }
     }
 
@@ -416,15 +457,26 @@ if (Test-StepDone "config") {
     $serverPort       = Get-StateVal "cfg_serverPort"
     $mqttPort         = Get-StateVal "cfg_mqttPort"
     $mqttExternalHost = Get-StateVal "cfg_mqttExternalHost"
+    $mqttExternalPort = Get-StateVal "cfg_mqttExternalPort" "1883"
+    $mqttExternalTls  = (Get-StateVal "cfg_mqttExternalTls") -eq "true"
+    $mqttCertFile     = Get-StateVal "cfg_mqttCertFile"
+    $mqttKeyFile      = Get-StateVal "cfg_mqttKeyFile"
     $isAirGapped      = (Get-StateVal "cfg_isAirGapped") -eq "true"
+    $externalUrl      = Get-StateVal "cfg_externalUrl"
+    $enableTls        = (Get-StateVal "cfg_enableTls") -eq "true"
+    $tlsCert          = Get-StateVal "cfg_tlsCert"
+    $tlsKey           = Get-StateVal "cfg_tlsKey"
+    $trustProxy       = (Get-StateVal "cfg_trustProxy") -eq "true"
     $adminEmail       = Get-StateVal "cfg_adminEmail"
     $adminPasswordPlain = Get-StateVal "cfg_adminPassword"
-    Write-Success "Loaded saved configuration (server=$serverIP`:$serverPort)"
+    Write-Success "Loaded saved configuration (server=$serverIP`:$serverPort, external=$externalUrl)"
 } else {
     Write-Host ""
     Write-Host "Deployment Mode:" -ForegroundColor Yellow
     Write-Host "  1. Air-Gapped / Local Network"
+    Write-Host "     Devices sit on the same network as this server. No domain or TLS needed."
     Write-Host "  2. Internet Connected (cloud)"
+    Write-Host "     Devices connect over the internet. Needs a public domain name or IP."
     $deployMode = Read-Host "Select (1 or 2, Enter for 1)"
     if ([string]::IsNullOrEmpty($deployMode)) { $deployMode = "1" }
     $isAirGapped = ($deployMode -eq "1")
@@ -433,21 +485,136 @@ if (Test-StepDone "config") {
         Where-Object { $_.InterfaceAlias -notlike "*Loopback*" -and $_.IPAddress -notlike "169.*" } |
         Select-Object -First 1).IPAddress
 
-    Write-Host "Detected local IP: $localIP"
-    $serverIP = Read-Host "Server IP (Enter for $localIP)"
-    if ([string]::IsNullOrEmpty($serverIP)) { $serverIP = $localIP }
-
-    $serverPort = Read-Host "HTTP port (Enter for 80)"
-    if ([string]::IsNullOrEmpty($serverPort)) { $serverPort = "80" }
-
-    $mqttPort = Read-Host "MQTT port (Enter for 1883)"
-    if ([string]::IsNullOrEmpty($mqttPort)) { $mqttPort = "1883" }
+    # Defaults for the settings only the cloud branch asks about, so the
+    # air-gapped path stays a straight run of Enter presses.
+    $enableTls  = $false
+    $tlsCert    = ""
+    $tlsKey     = ""
+    $trustProxy = $false
+    $mqttCertFile = ""
+    $mqttKeyFile  = ""
 
     if ($isAirGapped) {
+        Write-Host "Detected local IP: $localIP"
+        $serverIP = Read-Host "Server IP (Enter for $localIP)"
+        if ([string]::IsNullOrEmpty($serverIP)) { $serverIP = $localIP }
+
+        $serverPort = Read-Host "HTTP port (Enter for 80)"
+        if ([string]::IsNullOrEmpty($serverPort)) { $serverPort = "80" }
+
+        $mqttPort = Read-Host "MQTT port (Enter for 1883)"
+        if ([string]::IsNullOrEmpty($mqttPort)) { $mqttPort = "1883" }
+
+        $externalUrl      = "http://${serverIP}:${serverPort}"
         $mqttExternalHost = $serverIP
+        $mqttExternalPort = $mqttPort
+        $mqttExternalTls  = $false
     } else {
-        $mqttExternalHost = Read-Host "MQTT hostname for remote devices (Enter for $serverIP)"
-        if ([string]::IsNullOrEmpty($mqttExternalHost)) { $mqttExternalHost = $serverIP }
+        # --- Public address devices will use -------------------------------
+        Write-Host ""
+        Write-Host "Public Address:" -ForegroundColor Yellow
+        Write-Host "  The domain name (or public IP) that devices use to reach this server."
+        Write-Host "  Examples: mdm.yourcompany.com  |  203.0.113.10"
+        Write-Host "  A domain name is strongly preferred - it is required for TLS and lets"
+        Write-Host "  you move the server later without re-enrolling every device."
+        while ($true) {
+            $publicHost = (Read-Host "Domain name or public IP for devices").Trim()
+            if ($publicHost) { break }
+            Write-Host "  Required in cloud mode - devices need a public address." -ForegroundColor Yellow
+        }
+        $serverIP = $publicHost
+
+        # --- How TLS is terminated -----------------------------------------
+        Write-Host ""
+        Write-Host "HTTPS / TLS:" -ForegroundColor Yellow
+        Write-Host "  1. This server terminates TLS directly (recommended)"
+        Write-Host "     LocalDroid listens on 443 with your certificate. No IIS/nginx needed."
+        Write-Host "  2. A reverse proxy in front terminates TLS (IIS, nginx, Caddy)"
+        Write-Host "     LocalDroid listens on a plain HTTP backend port behind the proxy."
+        $tlsMode = Read-Host "Select (1 or 2, Enter for 1)"
+        if ([string]::IsNullOrEmpty($tlsMode)) { $tlsMode = "1" }
+
+        if ($tlsMode -eq "1") {
+            $serverPort = Read-Host "HTTPS port (Enter for 443)"
+            if ([string]::IsNullOrEmpty($serverPort)) { $serverPort = "443" }
+            $enableTls  = $true
+            $trustProxy = $false
+            $externalUrl = if ($serverPort -eq "443") { "https://$publicHost" } else { "https://${publicHost}:${serverPort}" }
+        } else {
+            $serverPort = Read-Host "Backend HTTP port LocalDroid listens on (Enter for 8080)"
+            if ([string]::IsNullOrEmpty($serverPort)) { $serverPort = "8080" }
+            $enableTls = $false
+            # Behind a proxy the client IP arrives in X-Forwarded-For; without
+            # this every request looks like 127.0.0.1 and rate limits misfire.
+            $trustProxy = $true
+
+            $urlIn = (Read-Host "Public URL devices will use (Enter for https://$publicHost)").Trim()
+            if ([string]::IsNullOrEmpty($urlIn)) { $urlIn = "https://$publicHost" }
+            # A bare domain makes the server emit http:// links in QR codes; the
+            # proxy then 301s to https://, which Android's HttpURLConnection
+            # refuses to follow - enrollment fails with no useful error.
+            if ($urlIn -notmatch '^https?://') {
+                $urlIn = "https://$urlIn"
+                Write-Host "  No scheme given - assuming HTTPS: $urlIn" -ForegroundColor Yellow
+            }
+            $externalUrl = $urlIn.TrimEnd('/')
+
+            Write-Host "  Point your proxy at http://127.0.0.1:$serverPort" -ForegroundColor Cyan
+        }
+
+        # --- MQTT ----------------------------------------------------------
+        Write-Host ""
+        Write-Host "MQTT:" -ForegroundColor Yellow
+        Write-Host "  Port 8883 = TLS (recommended over the internet). Port 1883 = unencrypted."
+        Write-Host "  The server itself always talks to the broker over loopback in plain text."
+        $mqttPort = Read-Host "Local broker port the server connects to (Enter for 1883)"
+        if ([string]::IsNullOrEmpty($mqttPort)) { $mqttPort = "1883" }
+
+        $mqttExternalHost = Read-Host "MQTT hostname for devices (Enter for $publicHost)"
+        if ([string]::IsNullOrEmpty($mqttExternalHost)) { $mqttExternalHost = $publicHost }
+
+        $mqttExternalPort = Read-Host "MQTT port for devices (Enter for 8883)"
+        if ([string]::IsNullOrEmpty($mqttExternalPort)) { $mqttExternalPort = "8883" }
+        $mqttExternalTls = ($mqttExternalPort -eq "8883")
+
+        # --- TLS certificate: asked ONCE, used by everything ---------------
+        # The web listener and the MQTT broker present the same certificate,
+        # so there is one question, not one per component. The files do NOT
+        # have to exist yet - win-acme/certbot normally runs after this
+        # installer, so we record the paths and apply-tls-certs.ps1 wires
+        # them up (and reloads on every renewal) once they appear.
+        if ($enableTls -or $mqttExternalTls) {
+            Write-Host ""
+            Write-Host "TLS Certificate:" -ForegroundColor Yellow
+            Write-Host "  One certificate covers both the web UI and the MQTT broker."
+            Write-Host "  It must be valid for $publicHost and issued by a public CA"
+            Write-Host "  (Let's Encrypt or commercial) - devices verify it against the"
+            Write-Host "  system trust store, so self-signed will not work."
+            Write-Host ""
+            Write-Host "  You do NOT need the files yet. Press Enter to accept the default"
+            Write-Host "  paths, finish the install, then run win-acme to write the certs"
+            Write-Host "  there. TLS switches on automatically once they exist." -ForegroundColor Gray
+
+            $tlsCert = (Read-Host "  Certificate path (Enter for C:\Certificates\fullchain.pem)").Trim('"', ' ')
+            if ([string]::IsNullOrEmpty($tlsCert)) { $tlsCert = "C:\Certificates\fullchain.pem" }
+            $tlsKey = (Read-Host "  Private key path (Enter for C:\Certificates\privkey.pem)").Trim('"', ' ')
+            if ([string]::IsNullOrEmpty($tlsKey)) { $tlsKey = "C:\Certificates\privkey.pem" }
+
+            # The broker uses the same pair - no second prompt.
+            $mqttCertFile = $tlsCert
+            $mqttKeyFile  = $tlsKey
+
+            if ((Test-Path $tlsCert) -and (Test-Path $tlsKey)) {
+                Write-Success "Certificate found - TLS will be enabled during this install"
+            } else {
+                Write-Host ""
+                Write-Warn "Certificate not present yet - that's fine, continuing."
+                Write-Host "  After the install, get a certificate and save it to those paths:" -ForegroundColor Yellow
+                Write-Host "      cd C:\win-acme; .\wacs.exe --target manual --host $publicHost ``" -ForegroundColor Gray
+                Write-Host "        --store pemfiles --pemfilespath C:\Certificates" -ForegroundColor Gray
+                Write-Host "  then run apply-tls-certs.ps1 from the install folder." -ForegroundColor Yellow
+            }
+        }
     }
 
     Write-Host ""
@@ -478,10 +645,27 @@ if (Test-StepDone "config") {
     Set-StateVal "cfg_serverPort"       $serverPort
     Set-StateVal "cfg_mqttPort"         $mqttPort
     Set-StateVal "cfg_mqttExternalHost" $mqttExternalHost
+    Set-StateVal "cfg_mqttExternalPort" $mqttExternalPort
+    Set-StateVal "cfg_mqttExternalTls"  ($mqttExternalTls.ToString().ToLower())
+    Set-StateVal "cfg_mqttCertFile"     $mqttCertFile
+    Set-StateVal "cfg_mqttKeyFile"      $mqttKeyFile
     Set-StateVal "cfg_isAirGapped"      ($isAirGapped.ToString().ToLower())
+    Set-StateVal "cfg_externalUrl"      $externalUrl
+    Set-StateVal "cfg_enableTls"        ($enableTls.ToString().ToLower())
+    Set-StateVal "cfg_tlsCert"          $tlsCert
+    Set-StateVal "cfg_tlsKey"           $tlsKey
+    Set-StateVal "cfg_trustProxy"       ($trustProxy.ToString().ToLower())
     Set-StateVal "cfg_adminEmail"       $adminEmail
     Set-StateVal "cfg_adminPassword"    $adminPasswordPlain
     Set-StepComplete "config"
+
+    Write-Host ""
+    Write-Host "Configuration summary:" -ForegroundColor Cyan
+    Write-Host "  Mode        : $(if ($isAirGapped) { 'Air-gapped / local network' } else { 'Internet connected (cloud)' })"
+    Write-Host "  Web UI / API: $externalUrl"
+    Write-Host "  Listening on: $(if ($enableTls) { 'https' } else { 'http' })://0.0.0.0:$serverPort"
+    Write-Host "  MQTT devices: ${mqttExternalHost}:${mqttExternalPort}$(if ($mqttExternalTls) { ' (TLS)' } else { ' (plain)' })"
+    Write-Host "  Admin login : $adminEmail"
 }
 
 # ============================================================================
@@ -545,6 +729,25 @@ if (Test-StepDone "env") {
     $jwtSecret = [Convert]::ToBase64String($bytes)
     $deployModeStr = if ($isAirGapped) { "airgapped" } else { "cloud" }
 
+    # An air-gapped box has no route to the portal, so it verifies signed
+    # licence files offline against the public key below. A cloud install can
+    # reach the portal, so point it there and a raw licence key activates on
+    # its own. Override with $env:LICENSE_SERVER_URL before running.
+    if ($null -ne $env:LICENSE_SERVER_URL) {
+        $licenseServerUrl = $env:LICENSE_SERVER_URL
+    } elseif ($isAirGapped) {
+        $licenseServerUrl = ""
+    } else {
+        $licenseServerUrl = "https://localdroid.app"
+    }
+
+    # A browser omits the default port from the Origin header, so an
+    # EXTERNAL_URL of http://host:80 arrives as http://host. List both forms
+    # or the origin check rejects a request that is in fact same-origin.
+    $allowedOrigins = $externalUrl
+    if ($externalUrl -match '^http://(.+):80$')   { $allowedOrigins = "$externalUrl,http://$($Matches[1])" }
+    if ($externalUrl -match '^https://(.+):443$') { $allowedOrigins = "$externalUrl,https://$($Matches[1])" }
+
     if (-not (Test-Path $serverDir)) { New-Item -ItemType Directory -Path $serverDir -Force | Out-Null }
 
     @"
@@ -553,6 +756,16 @@ if (Test-StepDone "env") {
 
 SERVER_HOST=0.0.0.0
 SERVER_PORT=$serverPort
+
+# TLS terminated by this server (cloud + direct-TLS mode). When a reverse
+# proxy handles TLS instead, ENABLE_TLS stays false and the proxy talks to
+# the plain HTTP port above.
+ENABLE_TLS=$($enableTls.ToString().ToLower())
+TLS_CERT=$tlsCert
+TLS_KEY=$tlsKey
+# Honour X-Forwarded-For. Only true behind a trusted proxy - turning this on
+# with no proxy in front lets clients spoof their own IP past rate limits.
+TRUST_PROXY=$($trustProxy.ToString().ToLower())
 
 DB_HOST=localhost
 DB_PORT=5432
@@ -564,11 +777,14 @@ DB_SSLMODE=disable
 MQTT_HOST=localhost
 MQTT_PORT=$mqttPort
 MQTT_EXTERNAL_HOST=$mqttExternalHost
+MQTT_EXTERNAL_PORT=$mqttExternalPort
+MQTT_EXTERNAL_USE_TLS=$($mqttExternalTls.ToString().ToLower())
 
 JWT_SECRET=$jwtSecret
 JWT_EXPIRES_HOURS=24
 
-EXTERNAL_URL=http://${serverIP}:${serverPort}
+EXTERNAL_URL=$externalUrl
+ALLOWED_ORIGINS=$allowedOrigins
 DEPLOYMENT_MODE=$deployModeStr
 
 STORAGE_PATH=./storage
@@ -578,7 +794,9 @@ APK_SIGNATURE_CHECKSUM=
 # default so a signed license.lic verifies out of the box on air-gapped
 # servers (the key is public: it can only VERIFY licenses, never create
 # them). Point LOCALDROID_LICENSE_FILE at your license.lic to auto-activate.
-LICENSE_SERVER_URL=
+# Cloud installs get the portal URL so a raw license key can activate online;
+# air-gapped installs leave it blank and verify signed licence files offline.
+LICENSE_SERVER_URL=$licenseServerUrl
 LICENSE_PUBLIC_KEY=woL+6yGOhnbu9E+iALVqMzIx1Uez7Rk2kP8pEXIQDDc=
 
 # Administrator credentials - seeded into the users table on first boot.
@@ -820,11 +1038,59 @@ if (Test-StepDone "mosquitto") {
 } else {
     $mqConfPath = "C:\Program Files\mosquitto\mosquitto.conf"
     if (Test-Path "C:\Program Files\mosquitto") {
-        @"
-# LocalDroid Mosquitto Configuration
+        # Air-gapped: one plain listener on the LAN, devices connect straight to it.
+        # Cloud: the plain listener is bound to loopback for the Go server only, and
+        # devices get a separate TLS listener. Binding 1883 to 127.0.0.1 matters —
+        # an internet-facing anonymous 1883 would let anyone publish device commands.
+        $listenerBlock = if ($isAirGapped -or -not $mqttExternalTls) {
+            @"
 listener $mqttPort
 allow_anonymous true
+"@
+        } else {
+            @"
+# Local listener: the LocalDroid server connects here over loopback only.
+listener $mqttPort 127.0.0.1
+allow_anonymous true
 
+# Public TLS listener: Android and Windows devices connect here.
+listener $mqttExternalPort
+certfile $mqttCertFile
+keyfile $mqttKeyFile
+allow_anonymous true
+"@
+        }
+
+        # A TLS listener pointing at files that don't exist takes the WHOLE
+        # broker down on start - including the loopback listener the server
+        # itself needs - so only write it once the certs are actually there.
+        # apply-tls-certs.ps1 adds the listener later without a reinstall.
+        $certsPresent = $mqttCertFile -and $mqttKeyFile -and
+                        (Test-Path $mqttCertFile) -and (Test-Path $mqttKeyFile)
+        if (-not $isAirGapped -and $mqttExternalTls -and -not $certsPresent) {
+            $listenerBlock = @"
+listener $mqttPort 127.0.0.1
+allow_anonymous true
+"@
+            Write-Warn "Certificate not in place yet - wrote a loopback-only broker config."
+            Write-Host "  This is expected if you haven't run win-acme yet. Once the cert" -ForegroundColor Yellow
+            Write-Host "  exists at $mqttCertFile, run:" -ForegroundColor Yellow
+            Write-Host "      .\apply-tls-certs.ps1" -ForegroundColor Gray
+            Write-Host "  to add the $mqttExternalPort TLS listener and restart the broker." -ForegroundColor Yellow
+        }
+
+        # Mosquitto refuses to start if persistence_location or the log
+        # directory is missing, so create it before writing a config that
+        # references it. This is also the path the Diagnostics page tells
+        # operators to read when the broker misbehaves.
+        $mqDataDir = "C:\ProgramData\localdroid\mosquitto"
+        New-Item -ItemType Directory -Path $mqDataDir -Force | Out-Null
+
+        @"
+# LocalDroid Mosquitto Configuration
+# Generated by install-windows-offline.ps1 on $(Get-Date -Format 'yyyy-MM-dd HH:mm')
+
+$listenerBlock
 # Resource limits — a runaway client can't exhaust the broker or flood the
 # network. Size max_connections to device count plus headroom.
 max_connections 1024
@@ -832,12 +1098,375 @@ max_queued_messages 200
 max_inflight_messages 20
 message_size_limit 10485760
 max_keepalive 120
+
+# Retain queued messages across restarts, and log where the Diagnostics page
+# points operators.
+persistence true
+persistence_location $mqDataDir\
+log_dest file $mqDataDir\mosquitto.log
+log_type error
+log_type warning
+log_type notice
 "@ | Out-File -FilePath $mqConfPath -Encoding UTF8
+
+        # Pick up the new config; a running broker keeps the old one otherwise.
+        # Start (not just restart) so a registered-but-stopped service comes up.
+        try {
+            $mqSvc = Get-Service mosquitto -ErrorAction SilentlyContinue
+            if ($mqSvc) {
+                if ($mqSvc.Status -eq 'Running') {
+                    Restart-Service mosquitto -Force -ErrorAction Stop
+                    Write-Success "Mosquitto service restarted"
+                } else {
+                    Start-Service mosquitto -ErrorAction Stop
+                    Write-Success "Mosquitto service started"
+                }
+            } else {
+                Write-Warn "No Mosquitto service registered - the broker won't start at boot."
+                Write-Host "  Re-run the installer, or register it with: mosquitto install" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Warn "Could not start the Mosquitto service: $_"
+            Write-Host "  Check $mqDataDir\mosquitto.log for the reason." -ForegroundColor Yellow
+        }
+
         Set-StepComplete "mosquitto"
-        Write-Success "Mosquitto configured on port $mqttPort"
+        if ($isAirGapped -or -not $mqttExternalTls) {
+            Write-Success "Mosquitto configured on port $mqttPort"
+        } elseif ($certsPresent) {
+            Write-Success "Mosquitto configured: $mqttPort (loopback) + $mqttExternalPort (TLS, devices)"
+        } else {
+            Write-Success "Mosquitto configured: $mqttPort (loopback) - TLS listener pending certificate"
+        }
     } else {
-        Write-Warn "Mosquitto not found at default path - configure mosquitto.conf manually"
-        Set-StepComplete "mosquitto"
+        # Deliberately NOT marked complete. Marking it done here means that
+        # installing Mosquitto afterwards and re-running silently skips the
+        # config step forever, leaving a broker with no LocalDroid listeners.
+        Write-Err "Mosquitto is not installed at C:\Program Files\mosquitto"
+        Write-Host "  The broker is required - devices cannot connect without it." -ForegroundColor Yellow
+        Write-Host "  Install it from: $(Join-Path $InstallersDir 'mosquitto-windows-x64.exe')" -ForegroundColor Yellow
+        Write-Host "  Tick the 'Service' component so it registers as a Windows service." -ForegroundColor Yellow
+        Write-Host "  Then re-run this script - it will configure the broker." -ForegroundColor Yellow
+    }
+}
+
+# ============================================================================
+# STEP 10a: Obtain a Let's Encrypt certificate (cloud only)
+# ============================================================================
+# Mirrors what install.sh does on Linux with certbot --standalone. win-acme's
+# "selfhosting" validation binds port 80 just long enough to answer the ACME
+# HTTP-01 challenge, so this works with no IIS and no nginx - the Go server
+# keeps 443 (or its backend port) to itself.
+if (-not $isAirGapped -and ($enableTls -or $mqttExternalTls)) {
+    Write-Step "Step 10a: TLS Certificate (Let's Encrypt)"
+
+    $certDir = Split-Path -Parent $tlsCert
+
+    if (Test-StepDone "letsencrypt") {
+        Write-Success "Certificate step already done, skipping"
+    } elseif ((Test-Path $tlsCert) -and (Test-Path $tlsKey)) {
+        Write-Success "Certificate already present at $tlsCert - skipping issuance"
+        Set-StepComplete "letsencrypt"
+    } else {
+        $wacs = @(
+            (Join-Path $InstallersDir "win-acme\wacs.exe"),
+            (Join-Path $ScriptDir "installers\win-acme\wacs.exe"),
+            "C:\win-acme\wacs.exe"
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+        Write-Host ""
+        Write-Host "A certificate can be requested automatically from Let's Encrypt."
+        Write-Host "Requirements - both must already be true:" -ForegroundColor Yellow
+        Write-Host "  1. DNS for $mqttExternalHost resolves to this server's public IP"
+        Write-Host "  2. TCP port 80 is open from the internet to this machine"
+        Write-Host "     (used only for the domain-ownership check, then released)"
+        if (-not $wacs) {
+            Write-Warn "win-acme not found in the bundle - automatic issuance unavailable."
+        }
+
+        $doAcme = "n"
+        if ($wacs) {
+            $doAcme = Read-Host "Request a certificate now? (Y/n)"
+            if ([string]::IsNullOrEmpty($doAcme)) { $doAcme = "y" }
+        }
+
+        if ($doAcme -match '^[Yy]') {
+            New-Item -ItemType Directory -Path $certDir -Force | Out-Null
+
+            # Port 80 must be free for the challenge, and reachable. Check the
+            # local half now - a bound port fails instantly and confusingly.
+            $port80 = Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue
+            if ($port80) {
+                Write-Warn "Something is already listening on port 80:"
+                $port80 | ForEach-Object {
+                    $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+                    Write-Host "    PID $($_.OwningProcess) $(if ($p) { $p.ProcessName })" -ForegroundColor Yellow
+                }
+                Write-Host "  Stop it, or answer n and supply a certificate manually." -ForegroundColor Yellow
+            }
+
+            try {
+                New-NetFirewallRule -DisplayName "LocalDroid ACME http-01 (80/tcp)" `
+                    -Direction Inbound -Action Allow -Protocol TCP -LocalPort 80 `
+                    -ErrorAction SilentlyContinue | Out-Null
+            } catch {}
+
+            Write-Host ""
+            Write-Host "  Running win-acme for $mqttExternalHost ..." -ForegroundColor Cyan
+            $acmeArgs = @(
+                "--target", "manual",
+                "--host", $mqttExternalHost,
+                "--validation", "selfhosting",
+                "--store", "pemfiles",
+                "--pemfilespath", $certDir,
+                "--accepttos",
+                "--emailaddress", $adminEmail
+            )
+            & $wacs @acmeArgs
+            $acmeExit = $LASTEXITCODE
+
+            # win-acme names its output after the target (e.g.
+            # mdm.example.com-chain.pem), and the exact suffixes vary between
+            # versions - so discover the files rather than assume a name, and
+            # normalise to the canonical paths .env already points at.
+            $issuedCert = Get-ChildItem -Path $certDir -Filter "*-chain.pem" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notlike "*chain-only*" } |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $issuedCert) {
+                $issuedCert = Get-ChildItem -Path $certDir -Filter "*-crt.pem" -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            }
+            $issuedKey = Get-ChildItem -Path $certDir -Filter "*-key.pem" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+            if ($issuedCert -and $issuedKey) {
+                Copy-Item $issuedCert.FullName $tlsCert -Force
+                Copy-Item $issuedKey.FullName  $tlsKey  -Force
+                Write-Success "Certificate issued and installed to $tlsCert"
+                Write-Host "  Source: $($issuedCert.Name) / $($issuedKey.Name)" -ForegroundColor Gray
+            } else {
+                Write-Warn "win-acme finished (exit $acmeExit) but no certificate was found in $certDir."
+                Write-Host "  Most common causes: DNS not pointing here yet, or port 80 blocked" -ForegroundColor Yellow
+                Write-Host "  upstream (cloud security group / router)." -ForegroundColor Yellow
+                Write-Host "  Fix that, then re-run:  .\install-windows-offline.ps1 -ResetStep letsencrypt" -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "  Skipping automatic issuance." -ForegroundColor Gray
+            Write-Host "  Place your certificate at $tlsCert and key at $tlsKey," -ForegroundColor Yellow
+            Write-Host "  then run .\apply-tls-certs.ps1" -ForegroundColor Yellow
+        }
+        Set-StepComplete "letsencrypt"
+    }
+}
+
+# ============================================================================
+# STEP 10b: TLS certificate automation (cloud + MQTT TLS only)
+# ============================================================================
+# Writes apply-tls-certs.ps1 and schedules it daily. It does two jobs:
+#   1. First run after win-acme/certbot: adds the TLS listener to
+#      mosquitto.conf, which the installer deliberately left out while the
+#      cert files were missing (a listener pointing at absent files stops the
+#      broker dead, taking the server's loopback connection with it).
+#   2. Every renewal: Mosquitto reads its certificate once at startup, so a
+#      renewed cert on disk does nothing until the service restarts. The
+#      scheduled task notices the file changed and restarts it.
+if (-not $isAirGapped -and $mqttExternalTls) {
+    Write-Step "Step 10b: TLS Certificate Automation"
+
+    if (Test-StepDone "tls_automation") {
+        Write-Success "TLS automation already configured, skipping"
+    } else {
+        $applyScript = Join-Path $ScriptDir "apply-tls-certs.ps1"
+        $stampFile   = Join-Path $ScriptDir ".tls-cert-stamp"
+
+        # Single-quoted here-string: this is the generated script's own source,
+        # so nothing here should expand at install time except the placeholders
+        # substituted immediately below.
+        $applyBody = @'
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Apply the TLS certificate to Mosquitto and restart it when the cert changes.
+.DESCRIPTION
+    Run this after obtaining or renewing a certificate. It is idempotent and
+    safe to run on a schedule - it only acts when the certificate on disk is
+    newer than the last one applied, unless -Force is passed.
+
+    The installer registers this as a daily scheduled task, so Let's Encrypt
+    renewals are picked up without anyone remembering to restart the broker.
+.PARAMETER Force
+    Rewrite the config and restart even if the certificate has not changed.
+#>
+param([switch]$Force)
+
+$ErrorActionPreference = "Stop"
+$CertFile   = "__CERT__"
+$KeyFile    = "__KEY__"
+$LocalPort  = "__LOCALPORT__"
+$TlsPort    = "__TLSPORT__"
+$StampFile  = "__STAMP__"
+$MqConfPath = "C:\Program Files\mosquitto\mosquitto.conf"
+$CertDir    = Split-Path -Parent $CertFile
+
+# win-acme renews on its own schedule and writes <host>-chain.pem /
+# <host>-key.pem into this folder - it does not touch our canonical filenames.
+# Promote the newest issued pair onto the paths mosquitto.conf and .env point
+# at, so a renewal flows through without anyone editing config by hand.
+if (Test-Path $CertDir) {
+    $issued = Get-ChildItem -Path $CertDir -Filter "*-chain.pem" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notlike "*chain-only*" } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $issued) {
+        $issued = Get-ChildItem -Path $CertDir -Filter "*-crt.pem" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    }
+    $issuedKey = Get-ChildItem -Path $CertDir -Filter "*-key.pem" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+    if ($issued -and $issuedKey) {
+        $canonicalAge = if (Test-Path $CertFile) { (Get-Item $CertFile).LastWriteTime } else { [datetime]::MinValue }
+        if ($issued.LastWriteTime -gt $canonicalAge) {
+            Copy-Item $issued.FullName    $CertFile -Force
+            Copy-Item $issuedKey.FullName $KeyFile  -Force
+            Write-Host "    Promoted renewed certificate: $($issued.Name)" -ForegroundColor Gray
+        }
+    }
+}
+
+if (-not ((Test-Path $CertFile) -and (Test-Path $KeyFile))) {
+    Write-Host "[WAIT] Certificate not present yet:" -ForegroundColor Yellow
+    Write-Host "         $CertFile"
+    Write-Host "         $KeyFile"
+    Write-Host "       Obtain one, then re-run this script. Nothing changed." -ForegroundColor Yellow
+    exit 0
+}
+
+# Fingerprint the cert so a renewal (new thumbprint) is detected even if the
+# file timestamp is preserved by whatever copied it into place.
+try {
+    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $CertFile
+    $current = $cert.Thumbprint
+    $expires = $cert.NotAfter
+} catch {
+    # Not a parseable single cert (e.g. a full chain PEM) - fall back to a
+    # content hash, which changes on renewal just the same.
+    $current = (Get-FileHash $CertFile -Algorithm SHA256).Hash
+    $expires = $null
+}
+
+$previous = if (Test-Path $StampFile) { (Get-Content $StampFile -Raw).Trim() } else { "" }
+if ($current -eq $previous -and -not $Force) {
+    Write-Host "[OK] Certificate unchanged - nothing to do." -ForegroundColor Green
+    if ($expires) { Write-Host "     Expires: $expires" -ForegroundColor Gray }
+    exit 0
+}
+
+Write-Host "==> Applying certificate to Mosquitto" -ForegroundColor Cyan
+if ($expires) { Write-Host "    Expires: $expires" -ForegroundColor Gray }
+
+# Mosquitto refuses to start if these directories are missing.
+$DataDir = "C:\ProgramData\localdroid\mosquitto"
+New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+
+@"
+# LocalDroid Mosquitto Configuration
+# Written by apply-tls-certs.ps1 on $(Get-Date -Format 'yyyy-MM-dd HH:mm')
+
+# Local listener: the LocalDroid server connects here over loopback only.
+listener $LocalPort 127.0.0.1
+allow_anonymous true
+
+# Public TLS listener: Android and Windows devices connect here.
+listener $TlsPort
+certfile $CertFile
+keyfile $KeyFile
+allow_anonymous true
+
+# Resource limits - a runaway client can't exhaust the broker or flood the
+# network. Size max_connections to device count plus headroom.
+max_connections 1024
+max_queued_messages 200
+max_inflight_messages 20
+message_size_limit 10485760
+max_keepalive 120
+
+# Retain queued messages across restarts, and log where the Diagnostics page
+# points operators.
+persistence true
+persistence_location $DataDir\
+log_dest file $DataDir\mosquitto.log
+log_type error
+log_type warning
+log_type notice
+"@ | Out-File -FilePath $MqConfPath -Encoding UTF8
+
+try {
+    Restart-Service mosquitto -Force -ErrorAction Stop
+    Write-Host "[OK] Mosquitto restarted with the new certificate." -ForegroundColor Green
+} catch {
+    Write-Host "[ERROR] Could not restart Mosquitto: $_" -ForegroundColor Red
+    Write-Host "        The config was written; restart the service manually." -ForegroundColor Yellow
+    exit 1
+}
+
+# Only stamp after a successful restart, so a failure retries next run.
+$current | Out-File -FilePath $StampFile -Encoding ASCII -NoNewline
+Write-Host "[OK] Devices can now connect on port $TlsPort (TLS)." -ForegroundColor Green
+
+# The Go server reads its certificate once at startup too. If it is the thing
+# terminating HTTPS (ENABLE_TLS=true), it needs a restart to serve the renewed
+# cert - the web UI would otherwise keep presenting the expired one.
+# Everything above already succeeded by this point, so a problem here must not
+# fail the run: this executes unattended from a scheduled task.
+$EnvPath = "__ENVPATH__"
+try {
+    if ((Test-Path $EnvPath) -and
+        ((Get-Content $EnvPath | Where-Object { $_ -match '^ENABLE_TLS=true' }) -ne $null) -and
+        (Get-Process localdroid-server -ErrorAction SilentlyContinue)) {
+        Write-Host "[ACTION] The LocalDroid server is serving HTTPS with the old certificate." -ForegroundColor Yellow
+        Write-Host "         Restart it to pick up the renewal: stop the server window," -ForegroundColor Yellow
+        Write-Host "         then run start-server.bat" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "[NOTE] Could not check whether the server needs restarting: $_" -ForegroundColor Gray
+}
+'@
+
+        $applyBody = $applyBody.
+            Replace('__CERT__',      $mqttCertFile).
+            Replace('__KEY__',       $mqttKeyFile).
+            Replace('__LOCALPORT__', $mqttPort).
+            Replace('__TLSPORT__',   $mqttExternalPort).
+            Replace('__STAMP__',     $stampFile).
+            Replace('__ENVPATH__',   $envPath)
+        $applyBody | Out-File -FilePath $applyScript -Encoding UTF8
+        Write-Success "Created: apply-tls-certs.ps1"
+
+        # Daily check. win-acme renews around 60 days, so a daily poll picks a
+        # renewal up within 24h without needing a win-acme hook to be wired.
+        try {
+            $taskName = "LocalDroid TLS certificate reload"
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
+                -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$applyScript`""
+            $trigger = New-ScheduledTaskTrigger -Daily -At 3am
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+                -RunLevel Highest -User "SYSTEM" -Description `
+                "Reloads Mosquitto when the LocalDroid TLS certificate is renewed." `
+                -ErrorAction Stop | Out-Null
+            Write-Success "Scheduled daily certificate check (3am) - renewals reload automatically"
+        } catch {
+            Write-Warn "Could not register the scheduled task: $_"
+            Write-Host "  Run apply-tls-certs.ps1 by hand after each certificate renewal." -ForegroundColor Yellow
+        }
+
+        # If the certs already exist, apply immediately so the install finishes
+        # with a working TLS listener rather than one pending a scheduled run.
+        if ((Test-Path $mqttCertFile) -and (Test-Path $mqttKeyFile)) {
+            & $applyScript -Force
+        }
+
+        Set-StepComplete "tls_automation"
     }
 }
 
@@ -862,7 +1491,7 @@ if "%ERRORLEVEL%"=="1" (
 )
 
 cd /d "%~dp0server"
-echo Server running at http://${serverIP}:${serverPort}
+echo Server running at $externalUrl
 echo Press Ctrl+C to stop
 echo.
 localdroid-server.exe
@@ -885,11 +1514,14 @@ Write-Step "Step 12: Remote Control Firewall"
 if (Test-StepDone "remote_firewall") {
     Write-Success "Remote-control firewall already configured, skipping"
 } else {
+    # Open the port devices actually connect to. In cloud mode the local broker
+    # port is loopback-only, so opening it would expose an anonymous listener
+    # to the internet for no reason.
     $fwRules = @(
-        @{ Name = "LocalDroid Server $serverPort/tcp"; Port = $serverPort; Proto = "TCP" },
-        @{ Name = "LocalDroid MQTT $mqttPort/tcp";      Port = $mqttPort;    Proto = "TCP" },
-        @{ Name = "LocalDroid TURN 3478/tcp";          Port = 3478;         Proto = "TCP" },
-        @{ Name = "LocalDroid TURN 3478/udp";          Port = 3478;         Proto = "UDP" }
+        @{ Name = "LocalDroid Server $serverPort/tcp";        Port = $serverPort;       Proto = "TCP" },
+        @{ Name = "LocalDroid MQTT $mqttExternalPort/tcp";    Port = $mqttExternalPort; Proto = "TCP" },
+        @{ Name = "LocalDroid TURN 3478/tcp";                 Port = 3478;              Proto = "TCP" },
+        @{ Name = "LocalDroid TURN 3478/udp";                 Port = 3478;              Proto = "UDP" }
     )
     foreach ($r in $fwRules) {
         try {
@@ -914,13 +1546,21 @@ if (Test-StepDone "remote_firewall") {
     }
 
     Write-Host ""
-    Write-Host "Android remote control over the internet needs a TURN relay (coturn)." -ForegroundColor Yellow
-    Write-Host "coturn has no native Windows package. Provide one on a Linux box/VPS" -ForegroundColor Yellow
-    Write-Host "(apt install coturn):" -ForegroundColor Yellow
-    Write-Host '      turnserver -n --use-auth-secret --static-auth-secret=localdroid_turn_secret_2024 \' -ForegroundColor Gray
-    Write-Host "        --realm=$serverIP --min-port=49152 --max-port=49200 --external-ip=<PUBLIC_IP>" -ForegroundColor Gray
-    Write-Host "  Keep the secret as 'localdroid_turn_secret_2024' to match the clients." -ForegroundColor Yellow
-    Write-Host "Windows-device VNC works with no TURN server." -ForegroundColor Green
+    Write-Host "Windows-device remote control (VNC) works now - it relays through the" -ForegroundColor Green
+    Write-Host "LocalDroid server on port $serverPort, so no extra setup is needed." -ForegroundColor Green
+    if (-not $isAirGapped) {
+        Write-Host ""
+        Write-Host "Android remote control over the internet needs a TURN relay (coturn)," -ForegroundColor Yellow
+        Write-Host "which has no native Windows build. Run coturn on any Linux host or VPS" -ForegroundColor Yellow
+        Write-Host "that devices can reach:" -ForegroundColor Yellow
+        Write-Host "      turnserver -n --use-auth-secret \" -ForegroundColor Gray
+        Write-Host "        --static-auth-secret=localdroid_turn_secret_2024 \" -ForegroundColor Gray
+        Write-Host "        --realm=$mqttExternalHost --min-port=49152 --max-port=49200 \" -ForegroundColor Gray
+        Write-Host "        --external-ip=<PUBLIC_IP>" -ForegroundColor Gray
+        Write-Host "  Keep the secret as 'localdroid_turn_secret_2024' to match the clients." -ForegroundColor Yellow
+    } else {
+        Write-Host "On a local network Android remote control works without a TURN relay." -ForegroundColor Green
+    }
     Write-Host ""
     Set-StepComplete "remote_firewall"
 }
@@ -936,14 +1576,38 @@ Write-Host "  LocalDroid MDM Server Installation Complete!" -ForegroundColor Gre
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "Installation : $ScriptDir" -ForegroundColor Cyan
-Write-Host "Web UI       : http://${serverIP}:${serverPort}" -ForegroundColor Cyan
-Write-Host "Login        : admin@localdroid.app / admin" -ForegroundColor Cyan
+Write-Host "Web UI       : $externalUrl" -ForegroundColor Cyan
+Write-Host "Login        : $adminEmail (password set during install)" -ForegroundColor Cyan
+Write-Host "MQTT devices : ${mqttExternalHost}:${mqttExternalPort}$(if ($mqttExternalTls) { ' (TLS)' } else { ' (plain)' })" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Start the server:" -ForegroundColor Yellow
 Write-Host "  Double-click: $(Join-Path $ScriptDir 'start-server.bat')"
 Write-Host ""
-Write-Host "Open firewall ports if needed: $serverPort (HTTP), $mqttPort (MQTT)" -ForegroundColor Yellow
-Write-Host ""
+
+if (-not $isAirGapped) {
+    $certsInPlace = $tlsCert -and (Test-Path $tlsCert) -and $tlsKey -and (Test-Path $tlsKey)
+    if (-not $certsInPlace) {
+        Write-Host "!! NEXT STEP: TLS certificate" -ForegroundColor Yellow
+        Write-Host "   No certificate at $tlsCert yet, so TLS is not active."
+        Write-Host "   1. Get one (Let's Encrypt via win-acme, or your commercial cert):"
+        Write-Host "        cd C:\win-acme; .\wacs.exe --target manual --host $mqttExternalHost ``" -ForegroundColor Gray
+        Write-Host "          --store pemfiles --pemfilespath $(Split-Path -Parent $tlsCert)" -ForegroundColor Gray
+        Write-Host "   2. Then run, from this folder:"
+        Write-Host "        .\apply-tls-certs.ps1" -ForegroundColor Gray
+        Write-Host "   Renewals after that reload automatically (daily scheduled task)."
+        Write-Host ""
+    }
+    Write-Host "Before enrolling devices, confirm:" -ForegroundColor Yellow
+    Write-Host "  - DNS for $mqttExternalHost resolves to this server's public IP"
+    Write-Host "  - Ports $serverPort and $mqttExternalPort are open to the internet (router/cloud firewall too)"
+    if ($trustProxy) {
+        Write-Host "  - Your reverse proxy forwards to http://127.0.0.1:$serverPort and sets X-Forwarded-For"
+    }
+    Write-Host ""
+    Write-Host "Enrollment QR codes are generated from $externalUrl - devices will use" -ForegroundColor Gray
+    Write-Host "that exact URL, so make sure it is reachable from outside your network." -ForegroundColor Gray
+    Write-Host ""
+}
 Write-Host "Progress file: $StateFile" -ForegroundColor Gray
 Write-Host "Re-run a step: .\install-windows-offline.ps1 -ResetStep <step_name>" -ForegroundColor Gray
 Write-Host "Start fresh  : .\install-windows-offline.ps1 -Fresh" -ForegroundColor Gray
