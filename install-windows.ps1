@@ -827,6 +827,42 @@ if (Test-StepDone "apk") {
     }
 }
 
+# ============================================================================
+# STEP 11a: Windows Agent EXE
+# ============================================================================
+# LocalDroid manages Windows devices as well as Android ones, and the server
+# hands enrolling Windows machines /agent/localdroid-agent.exe (handlers.go) —
+# the same storage\agent\ folder the APK lives in. Neither Windows installer has
+# ever copied it: `git log -S localdroid-agent.exe` over both .ps1 files is
+# empty. install.sh seeds BOTH agents via seed_agent_binary(); that fix was
+# never ported here, so every Windows install has silently shipped without the
+# Windows agent and needed a manual copy. This is that missing port.
+#
+# Deliberately NOT guarded by Test-StepDone: the marker means "a file was placed
+# once", not "the file is current", so on an upgrade it would keep a stale agent
+# and say nothing. The bundle's copy is always the right one to install.
+Write-Step "Step 11a: Windows Agent EXE"
+
+$exeDest = Join-Path $agentStorageDir "localdroid-agent.exe"
+New-Item -ItemType Directory -Path $agentStorageDir -Force | Out-Null
+
+$localExe = @(
+    (Join-Path $ScriptDir "seed\localdroid-agent.exe"),
+    (Join-Path $installDir "seed\localdroid-agent.exe"),
+    (Join-Path $ScriptDir "releases\localdroid-agent.exe"),
+    (Join-Path $installDir "releases\localdroid-agent.exe")
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if ($localExe) {
+    Copy-Item $localExe $exeDest -Force
+    $exeSize = [math]::Round((Get-Item $exeDest).Length / 1MB, 1)
+    Write-Success "Windows agent EXE copied from $localExe ($exeSize MB)"
+} else {
+    Write-Warn "No Windows agent EXE found in seed\ or releases\ folder."
+    Write-Host "  Windows device enrollment and agent self-update BOTH need this file." -ForegroundColor Yellow
+    Write-Host "  Drop a copy of localdroid-agent.exe at: $exeDest" -ForegroundColor Yellow
+}
+
 # STEP 11b: APK signing-cert checksum (Zero-Touch enrollment verification).
 # Run after the APK is seeded. Sidecar from build-native-bundle.sh first;
 # apksigner against the seeded file as a fallback for dev installs. Always
