@@ -1545,6 +1545,50 @@ pause
 }
 
 # ============================================================================
+# Auto-start service (boot + restart-on-crash)
+# ============================================================================
+# Linux gets a systemd unit with Restart=always / RestartSec=5 and
+# WantedBy=multi-user.target. Windows only ever got start-server.bat, which ends
+# in `pause` - an interactive launcher. So on Windows the MDM died on reboot and
+# stayed down until somebody logged in and double-clicked it. This is the
+# missing parity.
+#
+# A Scheduled Task rather than sc.exe: localdroid-server.exe is a plain console
+# binary with no windows/svc control handler, so the SCM would start it, get no
+# response to a service-control message, and kill it. The while() wrapper is what
+# supplies Restart=always semantics - a task on its own does not relaunch a
+# process that simply exits.
+#
+# Not guarded by Test-StepDone: -Force makes re-registration idempotent, and an
+# upgrade must be able to correct a stale command line.
+Write-Step "Auto-start service"
+
+try {
+    $svcTaskName = "LocalDroid MDM Server"
+    $svcDir      = Join-Path $ScriptDir "server"
+    $svcExe      = Join-Path $svcDir "localdroid-server.exe"
+
+    # Backtick-escaped $true so it survives into the child shell unexpanded.
+    $svcCmd = "while(`$true){ & '$svcExe'; Start-Sleep 5 }"
+    $svcArg = '-NoProfile -WindowStyle Hidden -Command "' + $svcCmd + '"'
+
+    Unregister-ScheduledTask -TaskName $svcTaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    $svcAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $svcArg -WorkingDirectory $svcDir
+    $svcSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0
+    $svcTrigger = New-ScheduledTaskTrigger -AtStartup
+
+    Register-ScheduledTask -TaskName $svcTaskName -Action $svcAction -Trigger $svcTrigger -Settings $svcSettings -User "SYSTEM" -RunLevel Highest -Force -Description "Starts the LocalDroid MDM server at boot and restarts it if it exits." -ErrorAction Stop | Out-Null
+
+    Write-Success "Auto-start registered: scheduled task '$svcTaskName' (SYSTEM, at boot)"
+    Write-Host "  Start it now with:  Start-ScheduledTask -TaskName '$svcTaskName'" -ForegroundColor Gray
+} catch {
+    Write-Warn "Could not register the auto-start task: $_"
+    Write-Host "  The server will NOT start on boot. Use start-server.bat manually," -ForegroundColor Yellow
+    Write-Host "  or register the task by hand once the cause is resolved." -ForegroundColor Yellow
+}
+
+# ============================================================================
 # STEP 12: Remote control - firewall + TURN guidance
 # ============================================================================
 # Windows VNC relays through the Go server (server port only). Android WebRTC
