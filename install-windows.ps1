@@ -998,7 +998,11 @@ max_queued_messages 200
 max_inflight_messages 20
 message_size_limit 10485760
 max_keepalive 120
-"@ | Out-File -FilePath $mqConfPath -Encoding UTF8
+# NOTE: ASCII, not UTF8. Out-File -Encoding UTF8 under Windows PowerShell 5.1
+# emits a BOM, and mosquitto refuses to parse one: it dies at startup with
+#   Error: Unknown configuration variable "<BOM>#"  ...  at mosquitto.conf:1
+# which as a service just looks like "starts then stops immediately".
+"@ | Out-File -FilePath $mqConfPath -Encoding ASCII
 
         # Pick up the new config; a running broker keeps the old one otherwise.
         try {
@@ -1270,7 +1274,11 @@ max_queued_messages 200
 max_inflight_messages 20
 message_size_limit 10485760
 max_keepalive 120
-"@ | Out-File -FilePath $MqConfPath -Encoding UTF8
+# NOTE: ASCII, not UTF8. Out-File -Encoding UTF8 under Windows PowerShell 5.1
+# emits a BOM, and mosquitto refuses to parse one: it dies at startup with
+#   Error: Unknown configuration variable "<BOM>#"  ...  at mosquitto.conf:1
+# which as a service just looks like "starts then stops immediately".
+"@ | Out-File -FilePath $MqConfPath -Encoding ASCII
 
 try {
     Restart-Service mosquitto -Force -ErrorAction Stop

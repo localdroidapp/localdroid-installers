@@ -1141,7 +1141,11 @@ log_dest file $mqDataDir\mosquitto.log
 log_type error
 log_type warning
 log_type notice
-"@ | Out-File -FilePath $mqConfPath -Encoding UTF8
+# NOTE: ASCII, not UTF8. Out-File -Encoding UTF8 under Windows PowerShell 5.1
+# emits a BOM, and mosquitto refuses to parse one: it dies at startup with
+#   Error: Unknown configuration variable "<BOM>#"  ...  at mosquitto.conf:1
+# which as a service just looks like "starts then stops immediately".
+"@ | Out-File -FilePath $mqConfPath -Encoding ASCII
 
         # Pick up the new config; a running broker keeps the old one otherwise.
         # Start (not just restart) so a registered-but-stopped service comes up.
@@ -1432,7 +1436,11 @@ log_dest file $DataDir\mosquitto.log
 log_type error
 log_type warning
 log_type notice
-"@ | Out-File -FilePath $MqConfPath -Encoding UTF8
+# NOTE: ASCII, not UTF8. Out-File -Encoding UTF8 under Windows PowerShell 5.1
+# emits a BOM, and mosquitto refuses to parse one: it dies at startup with
+#   Error: Unknown configuration variable "<BOM>#"  ...  at mosquitto.conf:1
+# which as a service just looks like "starts then stops immediately".
+"@ | Out-File -FilePath $MqConfPath -Encoding ASCII
 
 try {
     Restart-Service mosquitto -Force -ErrorAction Stop
