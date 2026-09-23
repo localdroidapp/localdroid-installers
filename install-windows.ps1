@@ -265,6 +265,7 @@ if (Test-StepDone "config") {
     $installDir       = Get-StateVal "cfg_installDir"
     $licenseServerUrl = Get-StateVal "cfg_licenseServerUrl"
     $adminEmail       = Get-StateVal "cfg_adminEmail"
+    $displayTz = Get-StateVal "cfg_displayTimezone"
     $adminPasswordPlain = Get-StateVal "cfg_adminPassword"
     Write-Success "Loaded saved configuration (external=$externalUrl, dir=$installDir)"
 } else {
@@ -457,6 +458,30 @@ if (Test-StepDone "config") {
     }
     Write-Host "  Admin login configured: $adminEmail" -ForegroundColor Green
 
+    # Display time zone for the dashboard (an IANA name; Windows zone names are
+    # different, so the common ones are translated). Seeded into the database on
+    # first boot; after that it is changed in Settings -> System and upgrades
+    # keep it. Blank shows each viewer's own browser time zone.
+    $winToIana = @{
+        'Pacific Standard Time' = 'America/Los_Angeles'; 'Mountain Standard Time' = 'America/Denver'
+        'US Mountain Standard Time' = 'America/Phoenix'; 'Central Standard Time' = 'America/Chicago'
+        'Eastern Standard Time' = 'America/New_York'; 'Alaskan Standard Time' = 'America/Anchorage'
+        'Hawaiian Standard Time' = 'Pacific/Honolulu'; 'Atlantic Standard Time' = 'America/Halifax'
+        'Newfoundland Standard Time' = 'America/St_Johns'; 'Central Standard Time (Mexico)' = 'America/Mexico_City'
+        'E. South America Standard Time' = 'America/Sao_Paulo'; 'UTC' = 'UTC'
+        'GMT Standard Time' = 'Europe/London'; 'W. Europe Standard Time' = 'Europe/Berlin'
+        'Romance Standard Time' = 'Europe/Paris'; 'Central Europe Standard Time' = 'Europe/Budapest'
+        'India Standard Time' = 'Asia/Kolkata'; 'China Standard Time' = 'Asia/Shanghai'
+        'Tokyo Standard Time' = 'Asia/Tokyo'; 'AUS Eastern Standard Time' = 'Australia/Sydney'
+    }
+    $tzDefault = $winToIana[(Get-TimeZone).Id]
+    Write-Host ""
+    Write-Host "Time zone the dashboard shows dates in (an IANA name such as America/Chicago)."
+    Write-Host "Leave blank to show each viewer's own browser time zone."
+    $displayTz = Read-Host "Display time zone [$(if ($tzDefault) { $tzDefault } else { 'blank' })]"
+    if ([string]::IsNullOrWhiteSpace($displayTz)) { $displayTz = $tzDefault }
+    if (-not $displayTz) { $displayTz = '' }
+
     Set-StateVal "cfg_serverIP"         $serverIP
     Set-StateVal "cfg_serverPort"       $serverPort
     Set-StateVal "cfg_mqttPort"         $mqttPort
@@ -474,6 +499,7 @@ if (Test-StepDone "config") {
     Set-StateVal "cfg_installDir"       $installDir
     Set-StateVal "cfg_licenseServerUrl" $licenseServerUrl
     Set-StateVal "cfg_adminEmail"       $adminEmail
+    Set-StateVal "cfg_displayTimezone"  $displayTz
     Set-StateVal "cfg_adminPassword"    $adminPasswordPlain
     Set-StepComplete "config"
 
@@ -507,7 +533,7 @@ if (Test-StepDone "clone") {
         # the git-clone fallback only works for developers with repo access.
         git clone https://github.com/zherrin85/localdroid.git $installDir
         if ($LASTEXITCODE -ne 0) {
-            Write-Err "git clone failed — extract the LocalDroid customer bundle into $installDir before running this script."
+            Write-Err "git clone failed - extract the LocalDroid customer bundle into $installDir before running this script."
             exit 1
         }
     }
@@ -640,6 +666,9 @@ LICENSE_PUBLIC_KEY=woL+6yGOhnbu9E+iALVqMzIx1Uez7Rk2kP8pEXIQDDc=
 # after first login if you prefer to manage the admin from the UI.
 LOCALDROID_ADMIN_EMAIL=$adminEmail
 LOCALDROID_ADMIN_PASSWORD=$adminPasswordPlain
+
+# Dashboard display time zone, seeded on first boot (Settings -> System changes it).
+LOCALDROID_TIMEZONE=$displayTz
 "@ | Out-File -FilePath $envPath -Encoding ASCII
 
     Set-StepComplete "env"
@@ -675,7 +704,7 @@ if (Test-StepDone "license_bootstrap") {
 }
 
 # ============================================================================
-# STEP 7: (reserved — APK signing-cert checksum is now derived in STEP 11
+# STEP 7: (reserved - APK signing-cert checksum is now derived in STEP 11
 # AFTER the APK is seeded, so we know the file is in place.)
 # ============================================================================
 
@@ -804,7 +833,7 @@ if (Test-StepDone "apk") {
 
     # Local-file priority list. seed/ is the canonical bundle layout; the
     # legacy releases/ paths stay so old hand-rolled deployments still work.
-    # We DO NOT fetch from the internet — the source repo is private and the
+    # We DO NOT fetch from the internet - the source repo is private and the
     # binary ships in the tarball.
     $localApk = @(
         (Join-Path $ScriptDir "seed\localdroid-agent.apk"),
@@ -831,7 +860,7 @@ if (Test-StepDone "apk") {
 # STEP 11a: Windows Agent EXE
 # ============================================================================
 # LocalDroid manages Windows devices as well as Android ones, and the server
-# hands enrolling Windows machines /agent/localdroid-agent.exe (handlers.go) —
+# hands enrolling Windows machines /agent/localdroid-agent.exe (handlers.go) -
 # the same storage\agent\ folder the APK lives in. Neither Windows installer has
 # ever copied it: `git log -S localdroid-agent.exe` over both .ps1 files is
 # empty. install.sh seeds BOTH agents via seed_agent_binary(); that fix was
@@ -947,7 +976,7 @@ if (Test-StepDone "mosquitto") {
     if (Test-Path "C:\Program Files\mosquitto") {
         # Air-gapped: one plain listener on the LAN, devices connect straight to it.
         # Cloud: the plain listener is bound to loopback for the Go server only, and
-        # devices get a separate TLS listener. Binding 1883 to 127.0.0.1 matters —
+        # devices get a separate TLS listener. Binding 1883 to 127.0.0.1 matters -
         # an internet-facing anonymous 1883 would let anyone publish device commands.
         $listenerBlock = if ($isAirGapped -or -not $mqttExternalTls) {
             @"
@@ -991,7 +1020,7 @@ allow_anonymous true
 # Generated by install-windows.ps1 on $(Get-Date -Format 'yyyy-MM-dd HH:mm')
 
 $listenerBlock
-# Resource limits — a runaway client can't exhaust the broker or flood the
+# Resource limits - a runaway client can't exhaust the broker or flood the
 # network. Size max_connections to device count plus headroom.
 max_connections 1024
 max_queued_messages 200
@@ -1428,10 +1457,10 @@ try {
 }
 
 # ============================================================================
-# STEP 14: Remote control — firewall + TURN guidance
+# STEP 14: Remote control - firewall + TURN guidance
 # ============================================================================
 # Windows VNC (for Windows devices) relays through the Go server over the HTTP
-# port — no extra ports. Android remote control uses WebRTC, which over the
+# port - no extra ports. Android remote control uses WebRTC, which over the
 # internet needs a TURN relay (coturn). coturn has no clean native Windows
 # package, so we open the firewall here and tell the operator how to provide a
 # relay. On a Windows host managing only Windows devices, you can ignore TURN.

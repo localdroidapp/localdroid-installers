@@ -572,6 +572,20 @@ EOF
         printf 'LOCALDROID_ADMIN_PASSWORD=%s\n' "$LOCALDROID_ADMIN_PASSWORD"
     } >> "$ENV_FILE"
 
+    # Display time zone for the dashboard. Seeded into the database on first
+    # boot; after that it is changed in Settings -> System and upgrades keep it.
+    DETECTED_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "")
+    echo ""
+    echo "Time zone the dashboard shows dates in (an IANA name such as America/Chicago)."
+    echo "Leave blank to show each viewer's own browser time zone."
+    read -rp "Display time zone [${DETECTED_TZ:-blank}]: " LOCALDROID_TIMEZONE
+    LOCALDROID_TIMEZONE=${LOCALDROID_TIMEZONE:-$DETECTED_TZ}
+    if [ -n "$LOCALDROID_TIMEZONE" ] && [ ! -e "/usr/share/zoneinfo/$LOCALDROID_TIMEZONE" ]; then
+        echo -e "${YELLOW}'$LOCALDROID_TIMEZONE' is not a known time zone; leaving it blank (set it later in Settings -> System).${NC}"
+        LOCALDROID_TIMEZONE=""
+    fi
+    printf '\n# Dashboard display time zone, seeded on first boot (Settings -> System changes it).\nLOCALDROID_TIMEZONE=%s\n' "$LOCALDROID_TIMEZONE" >> "$ENV_FILE"
+
     echo -e "${GREEN}Configuration file created!${NC}"
     mark_done "env"
 fi
@@ -1344,8 +1358,12 @@ else
             -d "$DB_NAME" -c "
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 filename   TEXT        PRIMARY KEY,
+                checksum   TEXT        NOT NULL DEFAULT '',
                 applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );" > /dev/null 2>&1 || {
+            );
+            -- Same shape the server uses (server/internal/migrate); older
+            -- installs created the table without checksum.
+            ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT NOT NULL DEFAULT '';" > /dev/null 2>&1 || {
             echo -e "${RED}Could not create schema_migrations table. Is the database accessible?${NC}"
             exit 1
         }
@@ -1688,56 +1706,55 @@ fi
 # ---------------------------------------------------------------------------
 # STEP 12: Systemd Service
 # ---------------------------------------------------------------------------
-if step_done "systemd"; then
-    echo -e "${GREEN}[SKIP] Systemd service already configured${NC}"
-else
-    echo ""
-    echo "=== Systemd Service Setup ==="
-    read -rp "Create systemd service for auto-start on boot? (y/n) [y]: " CREATE_SERVICE
-    CREATE_SERVICE=${CREATE_SERVICE:-y}
+# Not skipped on a re-run: re-writing the unit is idempotent, and a re-run must
+# be able to correct a stale one (like the Windows installer's scheduled task).
+#
+# The unit below is the exact text the server itself installs when it repairs
+# auto-start (linuxUnit in server/internal/upgrade/service.go). Keep the two
+# identical, or Settings -> System reports the service as needing repair.
+# ExecStartPre runs the supervisor hook the server writes at boot; the leading
+# "-" lets the very first start succeed before that file exists.
+echo ""
+echo "=== Systemd Service Setup ==="
+read -rp "Install the systemd service so the server starts at boot? (y/n) [y]: " CREATE_SERVICE
+CREATE_SERVICE=${CREATE_SERVICE:-y}
 
-    if [ "$CREATE_SERVICE" = "y" ]; then
-        SERVICE_USER=$(whoami)
-        SERVICE_FILE="/tmp/localdroid-backend.service"
+if [ "$CREATE_SERVICE" = "y" ]; then
+    SERVICE_USER=$(whoami)
+    SERVICE_NAME="localdroid-backend"
+    SERVICE_FILE="/tmp/$SERVICE_NAME.service"
+    SERVER_DIR="$SCRIPT_DIR/server"
 
-        cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=LocalDroid MDM Backend
-After=network.target postgresql.service mosquitto.service
-
-[Service]
-Type=simple
-User=$SERVICE_USER
-WorkingDirectory=$SCRIPT_DIR/server
-EnvironmentFile=$SCRIPT_DIR/server/.env
-EOF
-
+    {
+        printf '[Unit]\nDescription=LocalDroid MDM Backend\nAfter=network.target postgresql.service mosquitto.service\n\n'
+        printf '[Service]\nType=simple\nUser=%s\nWorkingDirectory=%s\nEnvironmentFile=%s/.env\n' \
+            "$SERVICE_USER" "$SERVER_DIR" "$SERVER_DIR"
         if [ "$SERVER_PORT" -lt 1024 ] 2>/dev/null; then
-            echo "AmbientCapabilities=CAP_NET_BIND_SERVICE" >> "$SERVICE_FILE"
+            printf 'AmbientCapabilities=CAP_NET_BIND_SERVICE\n'
         fi
+        printf 'ExecStartPre=-/bin/sh %s/localdroid-supervisor.sh\nExecStart=%s/localdroid-server\n' \
+            "$SERVER_DIR" "$SERVER_DIR"
+        printf 'Restart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n'
+    } > "$SERVICE_FILE"
 
-        cat >> "$SERVICE_FILE" << EOF
-ExecStart=$SCRIPT_DIR/server/localdroid-server
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        echo ""
-        echo "Service file created at: $SERVICE_FILE"
-        echo ""
-        echo "To install and enable it, run:"
-        echo -e "${YELLOW}  sudo cp $SERVICE_FILE /etc/systemd/system/${NC}"
-        echo -e "${YELLOW}  sudo systemctl daemon-reload${NC}"
-        echo -e "${YELLOW}  sudo systemctl enable localdroid-backend${NC}"
-        echo -e "${YELLOW}  sudo systemctl start localdroid-backend${NC}"
-        mark_done "systemd"
+    if sudo install -m 0644 "$SERVICE_FILE" "/etc/systemd/system/$SERVICE_NAME.service" \
+        && sudo systemctl daemon-reload \
+        && sudo systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; then
+        # restart, not start: a re-run after rebuilding the server must load the new binary.
+        if sudo systemctl restart "$SERVICE_NAME"; then
+            echo -e "${GREEN}Service '$SERVICE_NAME' installed, enabled at boot, and started.${NC}"
+        else
+            echo -e "${YELLOW}Service installed but did not start. See: sudo journalctl -u $SERVICE_NAME -n 50${NC}"
+        fi
+        rm -f "$SERVICE_FILE"
     else
-        mark_done "systemd"
+        echo -e "${YELLOW}Could not install the service automatically. Run:${NC}"
+        echo -e "${YELLOW}  sudo install -m 0644 $SERVICE_FILE /etc/systemd/system/$SERVICE_NAME.service${NC}"
+        echo -e "${YELLOW}  sudo systemctl daemon-reload${NC}"
+        echo -e "${YELLOW}  sudo systemctl enable --now $SERVICE_NAME${NC}"
     fi
 fi
+mark_done "systemd"
 
 # ---------------------------------------------------------------------------
 # STEP 13: TLS reachability check  (cloud mode only)
@@ -1804,8 +1821,11 @@ if [ "$DEPLOYMENT_MODE" = "cloud" ]; then
     fi
     echo ""
 fi
-echo "To start the server manually:"
-echo "  cd server && ./localdroid-server"
+echo "Server service (starts at boot, restarts if it stops):"
+echo "  sudo systemctl status localdroid-backend"
+echo "  sudo journalctl -u localdroid-backend -f     # live log"
+echo ""
+echo "Upgrades: Settings -> System -> Updates in the dashboard."
 echo ""
 echo -e "${CYAN}Progress saved to : $STATE_FILE${NC}"
 echo -e "${CYAN}To start fresh    : rm $STATE_FILE && ./install.sh${NC}"

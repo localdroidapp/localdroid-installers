@@ -85,13 +85,13 @@ Copy-Item -Path "$ScriptDir\web\dist\*" -Destination "$stagingDir\server\web\dis
 Write-Success "Web UI built and copied"
 
 # ============================================================================
-# Copy Android agent APK (from local files only — no internet fetch)
+# Copy Android agent APK (from local files only - no internet fetch)
 # ============================================================================
 Write-Step "Copying Android agent APK..."
 $stagingApk = "$stagingDir\server\storage\agent\localdroid-agent.apk"
 New-Item -ItemType Directory -Path "$stagingDir\server\storage\agent" -Force | Out-Null
 
-# Priority order matches install.sh's STEP 9 — seed/ first (canonical bundle),
+# Priority order matches install.sh's STEP 9 - seed/ first (canonical bundle),
 # releases/ second (legacy hand-rolled), then the developer's local build.
 $apkCandidates = @(
     "$ScriptDir\seed\localdroid-agent.apk",
@@ -140,7 +140,7 @@ log_type error
 log_type warning
 log_type notice
 
-# Resource limits — a runaway client can't exhaust the broker or flood the
+# Resource limits - a runaway client can't exhaust the broker or flood the
 # network. Size max_connections to device count plus headroom.
 max_connections 1024
 max_queued_messages 200
@@ -170,10 +170,10 @@ JWT_SECRET=CHANGE_ME_RANDOM_STRING
 EXTERNAL_URL=http://SERVER_IP
 # APK_SIGNATURE_CHECKSUM is derived from the actual seeded APK by install.sh /
 # install-windows.ps1 at install time (sidecar in seed/ takes priority, then
-# apksigner against the APK). Do NOT hardcode a value here — it goes stale
+# apksigner against the APK). Do NOT hardcode a value here - it goes stale
 # the moment the APK is re-signed.
 APK_SIGNATURE_CHECKSUM=
-# LocalDroid license-authority public key — safe to distribute (verify-only).
+# LocalDroid license-authority public key - safe to distribute (verify-only).
 # Point LOCALDROID_LICENSE_FILE at a signed license.lic to auto-activate.
 LICENSE_PUBLIC_KEY=woL+6yGOhnbu9E+iALVqMzIx1Uez7Rk2kP8pEXIQDDc=
 "@
