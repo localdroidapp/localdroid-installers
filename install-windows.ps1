@@ -515,6 +515,13 @@ if (Test-StepDone "config") {
 
 $serverDir = Join-Path $installDir "server"
 
+# Devices on the internet log in to the broker with their own credentials, like
+# install.sh does: the server renders passwd + acl into this folder from Postgres.
+# Air-gapped stays anonymous (devices are on the LAN), but the server still gets a
+# valid folder so rendering on enrollment doesn't log errors.
+$mqttAuthDir    = "C:\ProgramData\localdroid\mosquitto\auth"
+$mqttDeviceAuth = (-not $isAirGapped) -and $mqttExternalTls
+
 # ============================================================================
 # STEP 4: Clone or Update Repository
 # ============================================================================
@@ -642,6 +649,10 @@ MQTT_PORT=$mqttPort
 MQTT_EXTERNAL_HOST=$mqttExternalHost
 MQTT_EXTERNAL_PORT=$mqttExternalPort
 MQTT_EXTERNAL_USE_TLS=$($mqttExternalTls.ToString().ToLower())
+# Per-device broker logins: the server writes passwd + acl here from Postgres, and
+# restarts this service so Mosquitto loads them (Windows has no SIGHUP reload).
+MQTT_AUTH_DIR=$mqttAuthDir
+MQTT_RELOAD_SERVICE=$(if ($mqttDeviceAuth) { 'mosquitto' } else { '' })
 
 JWT_SECRET=$jwtSecret
 JWT_EXPIRES_HOURS=24
@@ -985,16 +996,31 @@ allow_anonymous true
 "@
         } else {
             @"
+# Security settings apply per listener: the loopback stays anonymous for the
+# server while the public listener requires each device's own login.
+per_listener_settings true
+
 # Local listener: the LocalDroid server connects here over loopback only.
 listener $mqttPort 127.0.0.1
 allow_anonymous true
 
-# Public TLS listener: Android and Windows devices connect here.
+# Public TLS listener: Android and Windows devices connect here with the
+# per-device credentials the server writes into $mqttAuthDir.
 listener $mqttExternalPort
 certfile $mqttCertFile
 keyfile $mqttKeyFile
-allow_anonymous true
+allow_anonymous false
+password_file $mqttAuthDir\passwd
+acl_file $mqttAuthDir\acl
 "@
+        }
+
+        # Seed empty auth files so the broker starts before the first device
+        # enrolls; the server rewrites them from Postgres at startup.
+        New-Item -ItemType Directory -Path $mqttAuthDir -Force | Out-Null
+        foreach ($f in 'passwd', 'acl') {
+            $p = Join-Path $mqttAuthDir $f
+            if (-not (Test-Path $p)) { New-Item -ItemType File -Path $p | Out-Null }
         }
 
         # A TLS listener pointing at files that don't exist takes the WHOLE
@@ -1282,9 +1308,21 @@ if ($current -eq $previous -and -not $Force) {
 Write-Host "==> Applying certificate to Mosquitto" -ForegroundColor Cyan
 if ($expires) { Write-Host "    Expires: $expires" -ForegroundColor Gray }
 
+# Per-device logins on the public listener, as the installer set up. A server
+# installed before that has no auth folder (and its .env no MQTT_AUTH_DIR), so it
+# stays anonymous rather than locking every device out on the next renewal.
+$AuthDir = "C:\ProgramData\localdroid\mosquitto\auth"
+$deviceAuth = if (Test-Path (Join-Path $AuthDir "passwd")) {
+    "allow_anonymous false`r`npassword_file $AuthDir\passwd`r`nacl_file $AuthDir\acl"
+} else {
+    "allow_anonymous true"
+}
+
 @"
 # LocalDroid Mosquitto Configuration
 # Written by apply-tls-certs.ps1 on $(Get-Date -Format 'yyyy-MM-dd HH:mm')
+
+per_listener_settings true
 
 # Local listener: the LocalDroid server connects here over loopback only.
 listener $LocalPort 127.0.0.1
@@ -1294,7 +1332,7 @@ allow_anonymous true
 listener $TlsPort
 certfile $CertFile
 keyfile $KeyFile
-allow_anonymous true
+$deviceAuth
 
 # Resource limits - a runaway client can't exhaust the broker or flood the
 # network. Size max_connections to device count plus headroom.
