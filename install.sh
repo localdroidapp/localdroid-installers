@@ -427,6 +427,10 @@ else
     JWT_SECRET=$(openssl rand -hex 32 2>/dev/null || \
         cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 64 | head -n 1)
     echo -e "${GREEN}Generated JWT secret${NC}"
+    # Shared by the server (which signs short-lived relay logins) and coturn.
+    # Per-install, so nobody else's credentials work on this relay.
+    TURN_SECRET="${TURN_SECRET:-$(openssl rand -hex 32 2>/dev/null || \
+        cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 64 | head -n 1)}"
 
     echo ""
     echo "Creating configuration: $ENV_FILE"
@@ -492,6 +496,10 @@ ALLOW_REMOTE_ENROLLMENT=true
 # login brute-force limiter sees real client IPs instead of 127.0.0.1.
 # Only enable when the server is actually behind a single trusted proxy.
 TRUST_PROXY=true
+
+# TURN relay for Android remote control over the internet. coturn's
+# static-auth-secret in /etc/turnserver.conf must be the same value.
+TURN_SECRET=$TURN_SECRET
 
 # Storage
 STORAGE_PATH=./storage
@@ -988,9 +996,11 @@ fi
 #
 # The agent + web admin clients authenticate to coturn with the "TURN REST API"
 # scheme (use-auth-secret): username "<expiry>:<id>", credential
-# base64(HMAC-SHA1(secret, username)). The shared secret is baked into the
-# compiled clients, so coturn MUST use the same value. Changing it requires
-# rebuilding both the APK and the web bundle — don't randomize it here.
+# base64(HMAC-SHA1(secret, username)). The server mints those credentials from
+# TURN_SECRET in its .env, so coturn must use the same value. Step 2 generates
+# one per install; an .env written before that has none, and the server then
+# falls back to the old built-in default, so coturn uses that too.
+TURN_SECRET=$(grep '^TURN_SECRET=' "$ENV_FILE" 2>/dev/null | head -n 1 | cut -d= -f2-)
 TURN_SECRET="${TURN_SECRET:-localdroid_turn_secret_2024}"
 
 if [ "$DEPLOYMENT_MODE" != "cloud" ]; then

@@ -611,6 +611,13 @@ if (Test-StepDone "env") {
     $jwtSecret = [Convert]::ToBase64String($bytes)
     $deployModeStr = if ($isAirGapped) { "airgapped" } else { "cloud" }
 
+    # TURN relay secret, shared by the server (which signs short-lived relay
+    # logins) and coturn. Per-install, so nobody else's logins work on it.
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    $turnBytes = New-Object byte[] 32
+    $rng.GetBytes($turnBytes); $rng.Dispose()
+    $turnSecret = -join ($turnBytes | ForEach-Object { $_.ToString("x2") })
+
     # A browser omits the default port from the Origin header, so an
     # EXTERNAL_URL of http://host:80 arrives as http://host. List both forms
     # or the origin check rejects a request that is in fact same-origin.
@@ -636,6 +643,12 @@ TLS_KEY=$tlsKey
 # Honour X-Forwarded-For. Only true behind a trusted proxy - turning this on
 # with no proxy in front lets clients spoof their own IP past rate limits.
 TRUST_PROXY=$($trustProxy.ToString().ToLower())
+
+# TURN relay for Android remote control over the internet (coturn, on a Linux
+# host). Its static-auth-secret must be this same value. TURN_EXTERNAL_HOST is
+# where devices find the relay; it defaults to MQTT_EXTERNAL_HOST.
+TURN_SECRET=$turnSecret
+# TURN_EXTERNAL_HOST=
 
 DB_HOST=localhost
 DB_PORT=5432
@@ -1360,22 +1373,11 @@ try {
 $current | Out-File -FilePath $StampFile -Encoding ASCII -NoNewline
 Write-Host "[OK] Devices can now connect on port $TlsPort (TLS)." -ForegroundColor Green
 
-# The Go server reads its certificate once at startup too. If it is the thing
-# terminating HTTPS (ENABLE_TLS=true), it needs a restart to serve the renewed
-# cert - the web UI would otherwise keep presenting the expired one.
-# Everything above already succeeded by this point, so a problem here must not
-# fail the run: this executes unattended from a scheduled task.
+# The LocalDroid server re-reads its own HTTPS certificate when the files
+# change (within a minute), so it needs no restart here.
 $EnvPath = "__ENVPATH__"
-try {
-    if ((Test-Path $EnvPath) -and
-        ((Get-Content $EnvPath | Where-Object { $_ -match '^ENABLE_TLS=true' }) -ne $null) -and
-        (Get-Process localdroid-server -ErrorAction SilentlyContinue)) {
-        Write-Host "[ACTION] The LocalDroid server is serving HTTPS with the old certificate." -ForegroundColor Yellow
-        Write-Host "         Restart it to pick up the renewal: stop the server window," -ForegroundColor Yellow
-        Write-Host "         then run start-server.bat" -ForegroundColor Yellow
-    }
-} catch {
-    Write-Host "[NOTE] Could not check whether the server needs restarting: $_" -ForegroundColor Gray
+if ((Test-Path $EnvPath) -and ((Get-Content $EnvPath | Where-Object { $_ -match '^ENABLE_TLS=true' }) -ne $null)) {
+    Write-Host "[OK] The web console picks up the new certificate by itself within a minute." -ForegroundColor Green
 }
 '@
 
@@ -1467,6 +1469,7 @@ pause
 # Not guarded by Test-StepDone: -Force makes re-registration idempotent, and an
 # upgrade must be able to correct a stale command line.
 Write-Step "Auto-start service"
+$serverStarted = $false
 
 try {
     $svcTaskName = "LocalDroid MDM Server"
@@ -1486,7 +1489,27 @@ try {
     Register-ScheduledTask -TaskName $svcTaskName -Action $svcAction -Trigger $svcTrigger -Settings $svcSettings -User "SYSTEM" -RunLevel Highest -Force -Description "Starts the LocalDroid MDM server at boot and restarts it if it exits." -ErrorAction Stop | Out-Null
 
     Write-Success "Auto-start registered: scheduled task '$svcTaskName' (SYSTEM, at boot)"
-    Write-Host "  Start it now with:  Start-ScheduledTask -TaskName '$svcTaskName'" -ForegroundColor Gray
+
+    # Start it now too. Registering only arms the boot trigger, so without this
+    # the server stayed down after install until a reboot or a manual start.
+    if (-not (Get-Process localdroid-server -ErrorAction SilentlyContinue)) {
+        Start-ScheduledTask -TaskName $svcTaskName -ErrorAction Stop
+    }
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline -and
+           -not (Get-NetTCPConnection -LocalPort $serverPort -State Listen -ErrorAction SilentlyContinue)) {
+        Start-Sleep -Seconds 2
+    }
+    if (Get-NetTCPConnection -LocalPort $serverPort -State Listen -ErrorAction SilentlyContinue) {
+        $serverStarted = $true
+        Write-Success "Server started and listening on port $serverPort"
+    } else {
+        Write-Warn "The server task started but nothing is listening on port $serverPort yet."
+        Write-Host "  Check $(Join-Path $svcDir 'storage\logs\server.log') for the reason." -ForegroundColor Yellow
+        if ($enableTls) {
+            Write-Host "  On HTTPS installs it waits for the certificate files and starts by itself once they exist." -ForegroundColor Yellow
+        }
+    }
 } catch {
     Write-Warn "Could not register the auto-start task: $_"
     Write-Host "  The server will NOT start on boot. Use start-server.bat manually," -ForegroundColor Yellow
@@ -1548,11 +1571,18 @@ if (Test-StepDone "remote_firewall") {
         Write-Host "Android remote control over the internet needs a TURN relay (coturn)," -ForegroundColor Yellow
         Write-Host "which has no native Windows build. Run coturn on any Linux host or VPS" -ForegroundColor Yellow
         Write-Host "that devices can reach:" -ForegroundColor Yellow
+        # The secret in .env, or the old built-in default the server falls back
+        # to when an older .env has none - coturn must use the same value.
+        $relaySecret = (Get-Content $envPath -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match '^TURN_SECRET=' } | Select-Object -First 1) -replace '^TURN_SECRET=', ''
+        if (-not $relaySecret) { $relaySecret = "localdroid_turn_secret_2024" }
         Write-Host "      turnserver -n --use-auth-secret \" -ForegroundColor Gray
-        Write-Host "        --static-auth-secret=localdroid_turn_secret_2024 \" -ForegroundColor Gray
+        Write-Host "        --static-auth-secret=$relaySecret \" -ForegroundColor Gray
         Write-Host "        --realm=$mqttExternalHost --min-port=49152 --max-port=49200 \" -ForegroundColor Gray
         Write-Host "        --external-ip=<PUBLIC_IP>" -ForegroundColor Gray
-        Write-Host "  The static-auth-secret MUST stay 'localdroid_turn_secret_2024' to match clients." -ForegroundColor Yellow
+        Write-Host "  The secret is TURN_SECRET in $envPath. Keep it private: anyone with it" -ForegroundColor Yellow
+        Write-Host "  can use your relay. If the relay isn't at $mqttExternalHost, set" -ForegroundColor Yellow
+        Write-Host "  TURN_EXTERNAL_HOST in that file and restart the server." -ForegroundColor Yellow
     } else {
         Write-Host "On a local network Android remote control works without a TURN relay." -ForegroundColor Green
     }
@@ -1575,8 +1605,14 @@ Write-Host "Web UI       : $externalUrl" -ForegroundColor Cyan
 Write-Host "Login        : $adminEmail (password set during install)" -ForegroundColor Cyan
 Write-Host "MQTT devices : ${mqttExternalHost}:${mqttExternalPort}$(if ($mqttExternalTls) { ' (TLS)' } else { ' (plain)' })" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Start the server:" -ForegroundColor Yellow
-Write-Host "  Double-click: $(Join-Path $installDir 'start-server.bat')"
+if ($serverStarted) {
+    Write-Host "Server       : running (scheduled task 'LocalDroid MDM Server', starts at boot)" -ForegroundColor Cyan
+} else {
+    Write-Host "Server       : not running yet - start it with:" -ForegroundColor Yellow
+    Write-Host "  Start-ScheduledTask -TaskName 'LocalDroid MDM Server'"
+}
+Write-Host "Restart      : Start-ScheduledTask -TaskName 'LocalDroid MDM Restart'" -ForegroundColor Gray
+Write-Host "Server log   : $(Join-Path $installDir 'server\storage\logs\server.log')" -ForegroundColor Gray
 Write-Host ""
 
 if (-not $isAirGapped) {
